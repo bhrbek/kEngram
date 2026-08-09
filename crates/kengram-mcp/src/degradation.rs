@@ -331,8 +331,10 @@ pub fn record_degradation(
     d: SearchDegradation,
     search_seq: u64,
 ) {
-    // At most one receipt entry per leg per request.
-    if receipt.iter().any(|e| e.leg == d.leg) {
+    // At most one receipt entry / counter cell per leg per request.
+    // Fan-out legs (pairwise/expansion) may re-enter: accumulate failed_attempts.
+    if let Some(existing) = receipt.iter_mut().find(|e| e.leg == d.leg) {
+        existing.failed_attempts = existing.failed_attempts.saturating_add(d.failed_attempts);
         return;
     }
     if let Some(c) = counters {
@@ -396,7 +398,7 @@ mod tests {
             .iter()
             .find(|c| c.leg == "tag_facet" && c.reason == "timeout")
             .unwrap();
-        assert_eq!(cell.count, 1);
+        assert_eq!(cell.count, 1, "KENGRAM_DELIVERY_A_RED:M6_counter_index");
         // neighboring cell zero
         let neighbor = snap
             .leg_degradations_total

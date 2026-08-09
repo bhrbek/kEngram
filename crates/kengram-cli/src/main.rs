@@ -633,6 +633,13 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
         contextual_chunk_fts_enabled,
         counters: Some(search_counters.clone()),
         rerank_timeout_ms: Some(config.reranker.timeout_seconds.saturating_mul(1000)),
+        thought_fts_timeout_ms: config.search.thought_fts_timeout_ms,
+        chunk_fts_timeout_ms: config.search.chunk_fts_timeout_ms,
+        contextual_chunk_fts_timeout_ms: config.search.contextual_chunk_fts_timeout_ms,
+        pairwise_chunk_fts_timeout_ms: config.search.pairwise_chunk_fts_timeout_ms,
+        domain_scope_timeout_ms: config.search.domain_scope_timeout_ms,
+        tag_facet_timeout_ms: config.search.tag_facet_timeout_ms,
+        expansion_fts_timeout_ms: config.search.expansion_fts_timeout_ms,
     };
     tracing::info!(
         chunk_serving_enabled,
@@ -696,9 +703,20 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     let mcp_service =
         StreamableHttpService::new(factory, LocalSessionManager::default().into(), http_cfg);
 
+    let mut effective_timeouts = config.search.effective_timeouts_json();
+    if let Some(obj) = effective_timeouts.as_object_mut() {
+        obj.insert(
+            "embedder_timeout_seconds".to_string(),
+            serde_json::json!(config.embedder.timeout_seconds),
+        );
+        obj.insert(
+            "reranker_timeout_seconds".to_string(),
+            serde_json::json!(config.reranker.timeout_seconds),
+        );
+    }
     let health_state = health::HealthState {
         counters: search_counters.clone(),
-        effective_timeouts: config.search.effective_timeouts_json(),
+        effective_timeouts,
     };
     let app = health::mount_health(axum::Router::new())
         .with_state(health_state)

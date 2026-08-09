@@ -2566,7 +2566,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(
             v.get("degradations").is_some(),
-            "MCP JSON must include degradations key"
+            "KENGRAM_DELIVERY_A_RED:V4_mcp_degradations_serialization"
         );
         let degs = v["degradations"].as_array().unwrap();
         assert_eq!(degs.len(), 1);
