@@ -159,3 +159,22 @@ No marker, any skip/count mismatch, or nonzero exit is failure.
     Judged gate is this registered supersession E2E only (A8 scoped: unprovisioned full kengram-mcp --lib 42501 producer_principal_unmapped is diagnostic, not pass/fail). B4: case_10b requires exact SQLSTATE P0001 and exact message supersession_old_thought_unavailable. B5: zero-receipt down removes supersession_receipt_json_key_count(jsonb) with pre-proven residue.
   Terminal marker: `PASS source-event-supersession selected=<n> executed=<n> failed=0 skipped=0`
   (exact selected/executed equality; zero failed/ignored; cargo must have run).
+
+## Migration 0036 multi-DB down (cluster-global role)
+
+Exact disposable proof (never production):
+
+```bash
+./scripts/test-migration-0036-multi-db-down.sh
+```
+
+Requires local superuser `ADMIN_DATABASE_URL` (default
+`postgres://kengram:kengram@localhost:5432/postgres`). Creates two disposable
+databases, migrates both through 0036, proves the legacy unconditional
+`DROP ROLE` fails with a dependency class, proves the guarded down succeeds on
+DB-A while DB-B still functions, then downs DB-B and removes the role only when
+cluster dependents are zero.
+
+Also: `bash scripts/test-source-event-supersession.sh` (single-DB supersession E2E
+including case_14 zero-receipt down).
+

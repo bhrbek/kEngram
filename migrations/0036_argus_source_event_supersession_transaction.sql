@@ -745,5 +745,29 @@ GRANT EXECUTE ON FUNCTION public.supersede_argus_source_event(
   uuid, text, text, text, text, uuid, text, text, text, jsonb, text, text, text, text, text, text
 ) TO kengram_rt_supersession;
 
--- least-privilege: no kengram_runtime membership for dedicated role (F5)
-REVOKE kengram_runtime FROM kengram_rt_supersession;
+-- least-privilege: no kengram_runtime membership for dedicated role (F5).
+-- Guarded: unconditional REVOKE of role membership can WARN/ERROR when the
+-- migrator lacks ADMIN OPTION on kengram_runtime (grantor-lacks-ADMIN-OPTION).
+-- Only attempt when an edge exists; swallow insufficient_privilege with NOTICE.
+DO $f5$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM pg_auth_members m
+    JOIN pg_roles r ON r.oid = m.roleid AND r.rolname = 'kengram_runtime'
+    JOIN pg_roles u ON u.oid = m.member AND u.rolname = 'kengram_rt_supersession'
+  ) THEN
+    BEGIN
+      EXECUTE 'REVOKE kengram_runtime FROM kengram_rt_supersession';
+    EXCEPTION
+      WHEN insufficient_privilege THEN
+        RAISE NOTICE
+          '0036: could not REVOKE kengram_runtime FROM kengram_rt_supersession (grantor lacks ADMIN OPTION): %',
+          SQLERRM;
+      WHEN undefined_object THEN
+        NULL;
+    END;
+  END IF;
+END
+$f5$;
+
