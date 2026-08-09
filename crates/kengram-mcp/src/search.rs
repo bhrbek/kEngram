@@ -1391,42 +1391,81 @@ async fn collect_expansion_rankings(
     profile.query_expansion_vector_knn_ms = elapsed_ms(vector_started);
 
     let fts_started = Instant::now();
+    // Aggregate expansion FTS fan-out per logical leg before recorder (receipt N == WARN N).
+    let mut thought_fts_fails: u32 = 0;
+    let mut thought_fts_last: Option<kengram_storage::StorageError> = None;
+    let mut chunk_fts_fails: u32 = 0;
+    let mut chunk_fts_last: Option<kengram_storage::StorageError> = None;
     for input in &inputs {
-        let thought_hits = bounded_fts_hits(
+        match kengram_storage::search_fts_bounded(
             pool,
             input,
             scope_filter,
             scope_prefix_filter,
-            lexical_top_k,
+            lexical_top_k as i64,
             lexical_timeout_ms,
-            counters,
-            degradations,
-            search_seq,
-            SearchLeg::ExpansionThoughtFts,
         )
-        .await;
-        profile.query_expansion_thought_fts_hits += thought_hits.len();
-        if !thought_hits.is_empty() {
-            out.thought_fts_rankings.push(thought_hits);
+        .await
+        {
+            Ok(hits) => {
+                profile.query_expansion_thought_fts_hits += hits.len();
+                if !hits.is_empty() {
+                    out.thought_fts_rankings.push(hits);
+                }
+            }
+            Err(e) => {
+                thought_fts_fails = thought_fts_fails.saturating_add(1);
+                thought_fts_last = Some(e);
+            }
         }
         if chunk_serving_enabled {
-            let chunk_hits = bounded_artifact_chunk_fts_hits(
+            match kengram_storage::search_artifact_chunks_fts_bounded(
                 pool,
                 input,
                 scope_filter,
                 scope_prefix_filter,
-                lexical_top_k,
+                lexical_top_k as i64,
+                lexical_timeout_ms,
+            )
+            .await
+            {
+                Ok(hits) => {
+                    profile.query_expansion_chunk_fts_hits += hits.len();
+                    if !hits.is_empty() {
+                        out.chunk_fts_rankings.push(hits);
+                    }
+                }
+                Err(e) => {
+                    chunk_fts_fails = chunk_fts_fails.saturating_add(1);
+                    chunk_fts_last = Some(e);
+                }
+            }
+        }
+    }
+    if thought_fts_fails > 0 && out.thought_fts_rankings.is_empty() {
+        if let Some(e) = thought_fts_last.as_ref() {
+            storage_leg_fail_open(
+                e,
+                SearchLeg::ExpansionThoughtFts,
                 lexical_timeout_ms,
                 counters,
                 degradations,
                 search_seq,
+                thought_fts_fails,
+            );
+        }
+    }
+    if chunk_fts_fails > 0 && out.chunk_fts_rankings.is_empty() {
+        if let Some(e) = chunk_fts_last.as_ref() {
+            storage_leg_fail_open(
+                e,
                 SearchLeg::ExpansionChunkFts,
-            )
-            .await;
-            profile.query_expansion_chunk_fts_hits += chunk_hits.len();
-            if !chunk_hits.is_empty() {
-                out.chunk_fts_rankings.push(chunk_hits);
-            }
+                lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                chunk_fts_fails,
+            );
         }
     }
     profile.query_expansion_fts_ms = elapsed_ms(fts_started);
@@ -1882,33 +1921,55 @@ async fn bounded_pairwise_artifact_chunk_fts_hits(
     search_seq: u64,
     leg: SearchLeg,
 ) -> Vec<Hit> {
-    let _leg = leg; // subqueries record via PairwiseChunkFts at call sites of storage
+    // Aggregate fan-out before recorder so receipt.failed_attempts=N matches the one
+    // structured WARN (smith PR20: one receipt N <-> one counter <-> one WARN N).
     let subqueries = pairwise_subqueries(query);
     if subqueries.is_empty() {
         return Vec::new();
     }
 
     let mut rankings = Vec::new();
+    let mut failed_attempts: u32 = 0;
+    let mut last_err: Option<kengram_storage::StorageError> = None;
     for subquery in &subqueries {
-        let hits = bounded_artifact_chunk_fts_hits(
+        match kengram_storage::search_artifact_chunks_fts_bounded(
             pool,
             subquery,
             scope_filter,
             scope_prefix_filter,
-            PAIRWISE_PER_SUBQUERY_TOP_K,
+            PAIRWISE_PER_SUBQUERY_TOP_K as i64,
             lexical_timeout_ms,
-            counters,
-            degradations,
-            search_seq,
-            SearchLeg::PairwiseChunkFts,
         )
-        .await;
-        if !hits.is_empty() {
-            rankings.push(hits);
+        .await
+        {
+            Ok(hits) if !hits.is_empty() => rankings.push(hits),
+            Ok(_) => {}
+            Err(e) => {
+                failed_attempts = failed_attempts.saturating_add(1);
+                last_err = Some(e);
+            }
         }
     }
 
     if rankings.is_empty() {
+        if let Some(e) = last_err.as_ref() {
+            tracing::warn!(
+                error = %e,
+                query_canceled = e.is_query_canceled(),
+                timeout_ms = lexical_timeout_ms,
+                failed_attempts,
+                "bounded pairwise fan-out failed; continuing with available search legs only",
+            );
+            storage_leg_fail_open(
+                e,
+                leg,
+                lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                failed_attempts.max(1),
+            );
+        }
         return Vec::new();
     }
     tracing::debug!(
