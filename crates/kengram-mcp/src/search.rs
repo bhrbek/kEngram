@@ -3286,6 +3286,74 @@ mod tests {
         assert_eq!(cell.count, 1);
     }
 
+    /// F1: non-default unequal lexical budgets route to the exact leg receipt.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn lexical_timeouts_unequal_route_and_receipt_timeout_ms(pool: PgPool) {
+        // Bad embedder skips vector path so FTS is the leg under lock.
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let needle = "unequal timeout route needle";
+        let _id = cap(&pool, needle, "global").await;
+
+        let counters = Arc::new(SearchCounters::new());
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE thoughts IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let resp = search_thoughts_with_tuning(
+            &pool,
+            &bad,
+            None,
+            None,
+            None,
+            SearchRuntimeOptions {
+                counters: Some(counters.clone()),
+                thought_fts_timeout_ms: 50,
+                chunk_fts_timeout_ms: 400,
+                contextual_chunk_fts_timeout_ms: 500,
+                pairwise_chunk_fts_timeout_ms: 600,
+                domain_scope_timeout_ms: 700,
+                tag_facet_timeout_ms: 1234,
+                expansion_fts_timeout_ms: 800,
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: needle.to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
+                include_profile: false,
+            },
+            DEFAULT_LEXICAL_TOP_K,
+            DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            DEFAULT_RERANK_CANDIDATE_POOL,
+        )
+        .await
+        .unwrap();
+        blocker.rollback().await.unwrap();
+
+        let fts = resp
+            .degradations
+            .iter()
+            .find(|d| d.leg == SearchLeg::ThoughtFts)
+            .expect("KENGRAM_DELIVERY_A_RED:F1_unequal_thought_fts_routed");
+        assert_eq!(
+            fts.timeout_ms,
+            Some(50),
+            "KENGRAM_DELIVERY_A_RED:F1_receipt_timeout_matches_thought_fts_budget"
+        );
+        assert_ne!(fts.timeout_ms, Some(1234));
+        assert_ne!(fts.timeout_ms, Some(DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS));
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_rerank_timeout_via_tei_wiremock(pool: PgPool) {
         let embedder = test_embedder();
