@@ -160,6 +160,22 @@ No marker, any skip/count mismatch, or nonzero exit is failure.
   Terminal marker: `PASS source-event-supersession selected=<n> executed=<n> failed=0 skipped=0`
   (exact selected/executed equality; zero failed/ignored; cargo must have run).
 
+
+## Migration 0037 — historical ANN projection drop (schema-ledger true-up)
+
+`embedding_ann_projections` was created by applied migration 0013 and later removed from
+prod by **out-of-band DDL on 2026-06-25** (qwen ANN decommission during BGE transition;
+see commit `467800c` posture note + Trinity GOLD 2026-08-09). No intermediate migration
+recorded the drop, so ledger said v13 applied while the relation was absent.
+
+**0037** is a recording migration: `DROP … IF EXISTS` for the projection tables/indexes
+plus a `migration_audit` row. It does **not** recreate the relation. Fresh `1..N` migrate
+creates via 0013 then drops via 0037 (matches prod). Applying on prod is a no-op drop when
+already absent and advances the ledger to 37.
+
+Out of scope for that lane: recreating the table, touching prod outside normal migrate,
+deploy.
+
 ## Migration 0036 multi-DB down (cluster-global role)
 
 Exact disposable proof (never production, never the shared host Postgres cluster):

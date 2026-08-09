@@ -128,13 +128,13 @@ docker exec "$CONTAINER" psql -X -v ON_ERROR_STOP=1 -U "$PGUSER" -d "$DB_A" \
 
 export SQLX_OFFLINE=true
 
-echo "== migrate both DBs to 0036 =="
+echo "== migrate both DBs through 0037 (includes historical ANN drop) =="
 ( cd "$ROOT" && DATABASE_URL="$(url_for "$DB_A")" sqlx migrate run --source migrations --no-dotenv ) >"$WORK/mig-a.out" 2>&1 \
   || { cat "$WORK/mig-a.out" >&2; fail "migrate A failed"; }
 ( cd "$ROOT" && DATABASE_URL="$(url_for "$DB_B")" sqlx migrate run --source migrations --no-dotenv ) >"$WORK/mig-b.out" 2>&1 \
   || { cat "$WORK/mig-b.out" >&2; fail "migrate B failed"; }
-grep -q "Applied 36/" "$WORK/mig-a.out" || fail "migrate A missing Applied 36"
-grep -q "Applied 36/" "$WORK/mig-b.out" || fail "migrate B missing Applied 36"
+grep -q "Applied 37/" "$WORK/mig-a.out" || fail "migrate A missing Applied 37"
+grep -q "Applied 37/" "$WORK/mig-b.out" || fail "migrate B missing Applied 37"
 
 role_exists() {
   docker exec "$CONTAINER" psql -X -U "$PGUSER" -d "$DB_A" -At \
@@ -191,9 +191,9 @@ docker exec "$CONTAINER" psql -X -v ON_ERROR_STOP=1 -U "$PGUSER" -d "$DB_B" \
   || fail "rebuild A CREATE failed"
 ( cd "$ROOT" && DATABASE_URL="$(url_for "$DB_A")" sqlx migrate run --source migrations --no-dotenv ) >"$WORK/mig-a2.out" 2>&1 \
   || { cat "$WORK/mig-a2.out" >&2; fail "re-migrate A failed"; }
-grep -q "Applied 36/" "$WORK/mig-a2.out" || fail "re-migrate A missing Applied 36"
+grep -q "Applied 37/" "$WORK/mig-a2.out" || fail "re-migrate A missing Applied 37"
 
-echo "== fixed down on A while B still has 0036 =="
+echo "== fixed down on A while B still has supersession 0036 objects =="
 psql_db_file "$DB_A" "$DOWN_FIXED" "$WORK/fixed-down-a.out" || {
   cat "$WORK/fixed-down-a.out" >&2
   fail "fixed down A failed"

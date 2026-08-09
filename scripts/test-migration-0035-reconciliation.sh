@@ -165,6 +165,34 @@ assert_state_equal() {
   done
 }
 
+# This suite is 0035-scoped: apply --target-version 35 and compare a 35-row ledger.
+# Later migrations (0036 multi-DB, 0037 ANN historical drop, …) must not expand
+# FULL_MANIFEST or sqlx --source for this harness. Build a disposable 1..35 view.
+SCOPED_MIGRATIONS="$WORK/migrations-1-35"
+mkdir -p "$SCOPED_MIGRATIONS"
+for f in "$MIGRATIONS"/*.sql; do
+  base="$(basename "$f")"
+  case "$base" in
+    *_*.sql) ;;
+    *) fail "unparseable migration filename while scoping: $base" ;;
+  esac
+  prefix="${base%%_*}"
+  digits="$prefix"
+  case "$prefix" in
+    +*) digits="${prefix#+}" ;;
+    -*) digits="${prefix#-}" ;;
+  esac
+  case "$digits" in
+    ''|*[!0-9]*) fail "unparseable version while scoping: $base" ;;
+  esac
+  version="$(printf '%s\n' "$digits" | sed 's/^0*//')"
+  test -n "$version" || version=0
+  if test "$version" -le 35; then
+    cp "$f" "$SCOPED_MIGRATIONS/"
+  fi
+done
+MIGRATIONS="$SCOPED_MIGRATIONS"
+
 FULL_MANIFEST="$WORK/source.manifest"
 source_manifest "$MIGRATIONS" "$FULL_MANIFEST"
 assert_exact_1_35 "$FULL_MANIFEST"
