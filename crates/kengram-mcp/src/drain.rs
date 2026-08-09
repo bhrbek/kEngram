@@ -14,11 +14,11 @@
 //! the row, re-embeds, re-inserts (no-op), and marks embedded — clean.
 
 use crate::finalize;
+use futures::stream::{self, StreamExt};
 use kengram_core::{
     Embedder, EmbedderError, Embedding, EmbeddingError, ExtractedRelation, Tagger, ThoughtId,
 };
 use sha2::{Digest, Sha256};
-use futures::stream::{self, StreamExt};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -404,10 +404,7 @@ async fn process_tag_job(
                             None
                         }
                         Ok(v) => {
-                            vocab_cache
-                                .lock()
-                                .await
-                                .insert(scope_key, Some(v.clone()));
+                            vocab_cache.lock().await.insert(scope_key, Some(v.clone()));
                             Some(v)
                         }
                         Err(e) => {
@@ -812,7 +809,9 @@ mod tests {
         };
         let tagger = FakeTagger::with_canned(tags.clone());
 
-        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1)
+            .await
+            .unwrap();
         assert_eq!(report.processed, 1);
         assert_eq!(report.completed, 1);
         assert_eq!(report.failed_transient, 0);
@@ -841,7 +840,9 @@ mod tests {
         let id = capture_and_enqueue_tag(&pool, "transient-fail content").await;
 
         let tagger = FakeTagger::always_failing(TaggerFakeBehavior::Timeout);
-        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1)
+            .await
+            .unwrap();
         assert_eq!(report.processed, 1);
         assert_eq!(report.completed, 0);
         assert_eq!(report.failed_transient, 1);
@@ -880,7 +881,9 @@ mod tests {
         }
 
         let tagger = FakeTagger::always_failing(TaggerFakeBehavior::Timeout);
-        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1)
+            .await
+            .unwrap();
         assert_eq!(report.processed, 1);
         assert_eq!(report.failed_permanent, 1);
 
@@ -896,7 +899,9 @@ mod tests {
         let _id = capture_and_enqueue_tag(&pool, "misconfigured tagger").await;
 
         let tagger = FakeTagger::always_failing(TaggerFakeBehavior::Misconfigured);
-        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1)
+            .await
+            .unwrap();
         assert_eq!(report.processed, 1);
         assert_eq!(report.failed_permanent, 1);
 
@@ -910,7 +915,9 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn drain_tags_empty_queue_is_a_noop(pool: PgPool) {
         let tagger = FakeTagger::new();
-        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1)
+            .await
+            .unwrap();
         assert_eq!(report.processed, 0);
         assert_eq!(report.completed, 0);
     }
@@ -991,7 +998,9 @@ mod tests {
         let _id = capture_and_enqueue_tag(&pool, "fresh thought").await;
 
         let tagger = FakeTagger::new();
-        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1)
+            .await
+            .unwrap();
         assert_eq!(report.completed, 1);
 
         let rec = tagger.last_call().expect("tag call recorded");
@@ -1046,7 +1055,9 @@ mod tests {
             },
         ]);
         let tagger = FakeTagger::with_canned_output(canned);
-        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1)
+            .await
+            .unwrap();
         assert_eq!(report.completed, 1);
 
         let related = kengram_storage::fetch_related_thoughts(
@@ -1079,7 +1090,9 @@ mod tests {
             note: None,
         }]);
         let tagger = FakeTagger::with_canned_output(first);
-        drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
+        drain_pending_tags(&pool, &tagger, 10, None, 1)
+            .await
+            .unwrap();
 
         let after_first = kengram_storage::fetch_related_thoughts(
             &pool,
@@ -1106,7 +1119,9 @@ mod tests {
             note: None,
         }]);
         let tagger = FakeTagger::with_canned_output(second);
-        drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
+        drain_pending_tags(&pool, &tagger, 10, None, 1)
+            .await
+            .unwrap();
 
         let after_second = kengram_storage::fetch_related_thoughts(
             &pool,
@@ -1160,7 +1175,9 @@ mod tests {
             note: None,
         }]);
         let tagger = FakeTagger::with_canned_output(canned);
-        drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
+        drain_pending_tags(&pool, &tagger, 10, None, 1)
+            .await
+            .unwrap();
 
         let related = kengram_storage::fetch_related_thoughts(
             &pool,
@@ -1195,7 +1212,9 @@ mod tests {
             },
         ]);
         let tagger = FakeTagger::with_canned_output(canned);
-        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1)
+            .await
+            .unwrap();
         assert_eq!(report.completed, 0);
         assert_eq!(report.failed_transient, 1);
         assert_eq!(report.failed_permanent, 0);
@@ -1271,17 +1290,25 @@ mod tests {
         assert_eq!(report.completed, 3);
         assert_eq!(report.failed_permanent, 0);
 
-        let ta = kengram_storage::fetch_thought_tags(&pool, a).await.unwrap().unwrap();
-        let tb = kengram_storage::fetch_thought_tags(&pool, b).await.unwrap().unwrap();
-        let tc = kengram_storage::fetch_thought_tags(&pool, c).await.unwrap().unwrap();
+        let ta = kengram_storage::fetch_thought_tags(&pool, a)
+            .await
+            .unwrap()
+            .unwrap();
+        let tb = kengram_storage::fetch_thought_tags(&pool, b)
+            .await
+            .unwrap()
+            .unwrap();
+        let tc = kengram_storage::fetch_thought_tags(&pool, c)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(ta.tags.topics, vec!["alpha-topic".to_string()]);
         assert_eq!(tb.tags.topics, vec!["beta-topic".to_string()]);
         assert_eq!(tc.tags.topics, vec!["gamma-topic".to_string()]);
 
         let calls = tagger.all_calls();
         assert_eq!(calls.len(), 3);
-        let contents: std::collections::HashSet<_> =
-            calls.into_iter().map(|c| c.content).collect();
+        let contents: std::collections::HashSet<_> = calls.into_iter().map(|c| c.content).collect();
         assert!(contents.iter().any(|s| s.contains("ALPHA_UNIQUE")));
         assert!(contents.iter().any(|s| s.contains("BETA_UNIQUE")));
         assert!(contents.iter().any(|s| s.contains("GAMMA_UNIQUE")));
@@ -1339,8 +1366,7 @@ mod tests {
         };
         let tagger = FakeTagger::with_substring(vec![("GOOD__".into(), good)]);
 
-        let poison =
-            capture_and_enqueue_tag(&pool, "POISON__TAG_JOB should fail permanent").await;
+        let poison = capture_and_enqueue_tag(&pool, "POISON__TAG_JOB should fail permanent").await;
         let g1 = capture_and_enqueue_tag(&pool, "GOOD__ one").await;
         let g2 = capture_and_enqueue_tag(&pool, "GOOD__ two").await;
         let g3 = capture_and_enqueue_tag(&pool, "GOOD__ three").await;
@@ -1353,7 +1379,10 @@ mod tests {
         assert_eq!(report.failed_permanent, 1);
 
         for id in [g1, g2, g3] {
-            let t = kengram_storage::fetch_thought_tags(&pool, id).await.unwrap().unwrap();
+            let t = kengram_storage::fetch_thought_tags(&pool, id)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(t.tags.topics, vec!["ok".to_string()]);
         }
         let remaining = kengram_storage::fetch_pending_tag_jobs(&pool, 10)

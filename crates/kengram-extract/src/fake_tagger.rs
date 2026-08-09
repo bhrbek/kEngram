@@ -148,7 +148,6 @@ impl FakeTagger {
         self.delay = delay;
         self
     }
-
 }
 
 impl Default for FakeTagger {
@@ -187,9 +186,7 @@ impl Tagger for FakeTagger {
         }
         // Permanent poison needle for concurrent-batch isolation tests.
         if thought_content.contains("POISON__TAG_JOB") {
-            return Err(TaggerError::Misconfigured(
-                "fake poison thought".into(),
-            ));
+            return Err(TaggerError::Misconfigured("fake poison thought".into()));
         }
         match self.behavior {
             FakeBehavior::Timeout => Err(TaggerError::Timeout { seconds: 5 }),
