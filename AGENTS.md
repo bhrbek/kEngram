@@ -162,19 +162,22 @@ No marker, any skip/count mismatch, or nonzero exit is failure.
 
 ## Migration 0036 multi-DB down (cluster-global role)
 
-Exact disposable proof (never production, never the shared host cluster):
+Exact disposable proof (never production, never the shared host Postgres cluster):
 
 ```bash
 ./scripts/test-migration-0036-multi-db-down.sh
 ```
 
-Spins an **ephemeral** Postgres on a random loopback port via `initdb`/`pg_ctl`
-using the same major as `pg_config` / Homebrew `postgresql@17`. Requires the
-**pgvector** extension for that major (`CREATE EXTENSION vector` preflight).
-Creates two disposable databases, migrates both through 0036, proves the legacy
-unconditional `DROP ROLE` fails with a dependency class, proves the guarded down
-succeeds on DB-A while DB-B still functions, then downs DB-B and removes the role
-only when cluster dependents are zero.
+**Self-contained:** starts `pgvector/pgvector:pg16` via Docker (same image family as
+`scripts/test-migration-0035-reconciliation.sh`), creates two databases inside that
+container, migrates both through 0036, and provisions vector via the image (no host
+Homebrew pgvector prerequisite). Requires `docker` + network pull of the image on
+first run.
+
+Proof cases:
+1. Watched RED — legacy unconditional `DROP ROLE` fails with a dependency class
+2. Guarded down on DB-A while DB-B still has 0036 — A clean, B function + role retained
+3. Guarded down on DB-B — role removed when last cluster dependent is gone
 
 Terminal marker (required):
 
@@ -186,6 +189,6 @@ Also: `bash scripts/test-source-event-supersession.sh` (single-DB supersession E
 including case_14 zero-receipt down).
 
 **Note:** do not edit `migrations/0036_argus_source_event_supersession_transaction.sql`
-in place after it has been applied in production — SQLx records the checksum;
-down-file-only repairs are the supported shape for this class.
+after it has been applied in production — SQLx records the checksum; down-file-only
+repairs are the supported shape for this class.
 
