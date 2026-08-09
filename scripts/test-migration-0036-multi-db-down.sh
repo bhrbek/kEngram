@@ -17,7 +17,7 @@ CONTAINER_ID=""
 DOWN_FIXED="$ROOT/migrations/rollback/0036_argus_source_event_supersession_transaction_down.sql"
 DB_A="kengram_0036_multi_a"
 DB_B="kengram_0036_multi_b"
-PGUSER="kengram_accept"
+PGUSER="kengram"  # superuser for disposable cluster; migrations OWNER TO kengram (neo F2a)
 PGPASS="acceptance-only"
 
 fail() {
@@ -180,10 +180,15 @@ if ! grep -Eiq 'depend|cannot be dropped|being used by' "$WORK/broken-down.out";
 fi
 pass_case watched-RED-broken-unconditional-drop
 
-# Rebuild A cleanly (broken down is multi-statement; may partially apply)
+# Rebuild A cleanly (broken down is multi-statement; may partially apply).
+# DROP DATABASE cannot run inside a multi-statement implicit transaction (neo F2b) —
+# issue DROP and CREATE as separate psql requests.
 docker exec "$CONTAINER" psql -X -v ON_ERROR_STOP=1 -U "$PGUSER" -d "$DB_B" \
-  -c "DROP DATABASE IF EXISTS ${DB_A} WITH (FORCE); CREATE DATABASE ${DB_A} OWNER ${PGUSER};" >/dev/null \
-  || fail "rebuild A failed"
+  -c "DROP DATABASE IF EXISTS ${DB_A} WITH (FORCE);" >/dev/null \
+  || fail "rebuild A DROP failed"
+docker exec "$CONTAINER" psql -X -v ON_ERROR_STOP=1 -U "$PGUSER" -d "$DB_B" \
+  -c "CREATE DATABASE ${DB_A} OWNER ${PGUSER};" >/dev/null \
+  || fail "rebuild A CREATE failed"
 ( cd "$ROOT" && DATABASE_URL="$(url_for "$DB_A")" sqlx migrate run --source migrations --no-dotenv ) >"$WORK/mig-a2.out" 2>&1 \
   || { cat "$WORK/mig-a2.out" >&2; fail "re-migrate A failed"; }
 grep -q "Applied 36/" "$WORK/mig-a2.out" || fail "re-migrate A missing Applied 36"
