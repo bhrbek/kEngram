@@ -331,8 +331,11 @@ pub fn record_degradation(
     d: SearchDegradation,
     search_seq: u64,
 ) {
-    // At most one receipt entry / counter cell per leg per request.
-    // Fan-out legs (pairwise/expansion) may re-enter: accumulate failed_attempts.
+    // At most one receipt entry / counter cell / structured WARN per leg per request.
+    // Fan-out callers must aggregate failed_attempts BEFORE the first call so the
+    // single WARN carries failed_attempts=N matching the receipt (smith PR20).
+    // Re-entry still accumulates defensively; WARN already fired with first value —
+    // prefer aggregate-before-call so that path is unused for fan-out.
     if let Some(existing) = receipt.iter_mut().find(|e| e.leg == d.leg) {
         existing.failed_attempts = existing.failed_attempts.saturating_add(d.failed_attempts);
         return;
@@ -406,6 +409,35 @@ mod tests {
             .find(|c| c.leg == "domain_scope" && c.reason == "timeout")
             .unwrap();
         assert_eq!(neighbor.count, 0);
+    }
+
+    #[test]
+    fn fanout_aggregated_attempts_match_one_warn_contract() {
+        // Caller aggregates N attempts into one record_degradation call.
+        let c = Arc::new(SearchCounters::new());
+        let mut receipt = vec![];
+        let seq = c.next_search_seq();
+        record_degradation(
+            Some(&c),
+            &mut receipt,
+            SearchDegradation::new(
+                SearchLeg::PairwiseChunkFts,
+                DegradationReason::Timeout,
+                DegradationFallback::AvailableSearchLegs,
+                Some(50),
+                2,
+            ),
+            seq,
+        );
+        assert_eq!(receipt.len(), 1);
+        assert_eq!(receipt[0].failed_attempts, 2);
+        let snap = c.snapshot(serde_json::json!({}));
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|x| x.leg == "pairwise_chunk_fts" && x.reason == "timeout")
+            .unwrap();
+        assert_eq!(cell.count, 1, "one logical counter delta for N attempts");
     }
 
     #[test]
