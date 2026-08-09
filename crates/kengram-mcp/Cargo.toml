@@ -29,3 +29,5 @@ uuid.workspace = true
 kengram-extract.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber.workspace = true
+wiremock.workspace = true
+
