@@ -38,6 +38,9 @@ Focused selectors (examples; still require the same env bindings):
 ```bash
 cargo test -p kengram-mcp --lib retract -- --test-threads=1
 cargo test -p kengram-mcp --lib server::tests::retract_thought_tool_reports_chain_from_not_not_found -- --exact --test-threads=1
+cargo test -p kengram-mcp --lib drain::tests::drain_tags_concurrent_no_cross_thought_bleed -- --exact --test-threads=1
+cargo test -p kengram-mcp --lib drain::tests::drain_tags_concurrency_gt_one_beats_sequential_floor -- --exact --test-threads=1
+cargo test -p kengram-mcp --lib drain::tests::drain_tags_poison_job_does_not_stall_concurrent_batch -- --exact --test-threads=1
 # Board 550689 payload_hash shape — unit + production callers (Jones 555325/26, 555885 exact-shape)
 cargo test -p kengram-mcp --lib link::tests::payload_hash_rejects_uuid_with_hyphens -- --exact --test-threads=1
 cargo test -p kengram-mcp --lib link::tests::payload_hash_accepts_64_lowercase_hex -- --exact --test-threads=1

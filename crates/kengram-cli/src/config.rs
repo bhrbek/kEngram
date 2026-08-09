@@ -488,6 +488,14 @@ pub struct TaggerConfig {
     /// give the model more context but cost prompt tokens; smaller values
     /// let new terms emerge faster. Default 50.
     pub scope_vocab_size: u32,
+    /// Max concurrent in-flight `tagger.tag()` calls within one drain tick.
+    /// Default 2 (live ollama gemma3:12b tends to serialize; N=2 overlaps
+    /// usefully with per-job DB work; raise to 3–4 if the backend has parallel
+    /// slots). Set 1 for sequential. Clamped to ≥1 at runtime.
+    pub concurrency: u32,
+    /// Optional claim size for `pending_tags` only. `None` (default) uses
+    /// `[worker].batch_size`. Decouples tag queue depth from embed batching.
+    pub batch_size: Option<i64>,
     /// Sub-section for the HTTP-sidecar backend (`provider = "http"`).
     /// `None` when that backend isn't selected; the `[tagger.http]` toml
     /// block deserializes into `Some(...)`. The flat fields above remain
@@ -547,6 +555,8 @@ impl Default for TaggerConfig {
             system_prompt_file: None,
             scope_vocab_enabled: true,
             scope_vocab_size: 50,
+            concurrency: 2,
+            batch_size: None,
             http: None,
         }
     }
@@ -1095,5 +1105,26 @@ mod tests {
             .unwrap();
         assert!(!c.tagger.scope_vocab_enabled);
         assert_eq!(c.tagger.scope_vocab_size, 20);
+    }
+
+    #[test]
+    fn tagger_concurrency_and_batch_size_defaults_and_toml() {
+        let c = Config::default();
+        assert_eq!(c.tagger.concurrency, 2);
+        assert_eq!(c.tagger.batch_size, None);
+
+        let toml = r#"
+            [tagger]
+            provider = "openai-compatible"
+            concurrency = 3
+            batch_size = 8
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert_eq!(c.tagger.concurrency, 3);
+        assert_eq!(c.tagger.batch_size, Some(8));
     }
 }

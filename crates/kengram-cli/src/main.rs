@@ -803,6 +803,14 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
     // mirrors the capture-side enqueue gate. No tag rows can exist in the
     // queue if no captures enqueued them, so even spinning the loop would
     // be wasted ticks; just don't spawn it.
+    // Tag drain claim size: optional [tagger].batch_size override, else worker.
+    let tag_batch_size = config
+        .tagger
+        .batch_size
+        .filter(|n| *n > 0)
+        .unwrap_or(batch_size);
+    let tag_concurrency = usize::try_from(config.tagger.concurrency.max(1)).unwrap_or(1);
+
     let tagger_summary = match tagger {
         Some(t) => {
             let tag_pool = pool.clone();
@@ -814,13 +822,14 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
                     tag_pool,
                     tag_tagger,
                     interval,
-                    batch_size,
+                    tag_batch_size,
                     scope_vocab_limit,
+                    tag_concurrency,
                     tag_cancel,
                 )
                 .await;
             });
-            format!("enabled ({model_id})")
+            format!("enabled ({model_id}, concurrency={tag_concurrency}, batch={tag_batch_size})")
         }
         None => "disabled".to_string(),
     };
@@ -832,6 +841,8 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
         model_id = %config.embedder.model_id,
         tagger = %tagger_summary,
         tagger_model_id = ?tagger_model_id,
+        tagger_concurrency = tag_concurrency,
+        tag_batch_size,
         scope_vocab_limit = ?scope_vocab_limit,
         ingest_hygiene_enabled,
         "kengram worker started"
@@ -930,6 +941,7 @@ async fn tag_drainer_loop(
     interval: Duration,
     batch_size: i64,
     scope_vocab_limit: Option<i64>,
+    concurrency: usize,
     cancel: CancellationToken,
 ) {
     let mut ticker = tokio::time::interval(interval);
@@ -948,6 +960,7 @@ async fn tag_drainer_loop(
                     tagger.as_ref(),
                     batch_size,
                     scope_vocab_limit,
+                    concurrency,
                 )
                 .await
                 {
