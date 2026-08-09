@@ -1442,7 +1442,9 @@ async fn collect_expansion_rankings(
             }
         }
     }
-    if thought_fts_fails > 0 && out.thought_fts_rankings.is_empty() {
+    // Record even on mixed success+timeout: failed attempts must remain observable
+    // when another subquery produces a ranking (smith PR20 F1 mixed-success).
+    if thought_fts_fails > 0 {
         if let Some(e) = thought_fts_last.as_ref() {
             storage_leg_fail_open(
                 e,
@@ -1455,7 +1457,7 @@ async fn collect_expansion_rankings(
             );
         }
     }
-    if chunk_fts_fails > 0 && out.chunk_fts_rankings.is_empty() {
+    if chunk_fts_fails > 0 {
         if let Some(e) = chunk_fts_last.as_ref() {
             storage_leg_fail_open(
                 e,
@@ -1951,14 +1953,16 @@ async fn bounded_pairwise_artifact_chunk_fts_hits(
         }
     }
 
-    if rankings.is_empty() {
+    // Record failed subqueries even when other subqueries produced rankings
+    // (mixed success+timeout must retain failed_attempts — smith PR20 F1).
+    if failed_attempts > 0 {
         if let Some(e) = last_err.as_ref() {
             tracing::warn!(
                 error = %e,
                 query_canceled = e.is_query_canceled(),
                 timeout_ms = lexical_timeout_ms,
                 failed_attempts,
-                "bounded pairwise fan-out failed; continuing with available search legs only",
+                "bounded pairwise fan-out had failed subqueries; continuing with available hits",
             );
             storage_leg_fail_open(
                 e,
@@ -1970,6 +1974,8 @@ async fn bounded_pairwise_artifact_chunk_fts_hits(
                 failed_attempts.max(1),
             );
         }
+    }
+    if rankings.is_empty() {
         return Vec::new();
     }
     tracing::debug!(
