@@ -192,3 +192,18 @@ including case_14 zero-receipt down).
 after it has been applied in production — SQLx records the checksum; down-file-only
 repairs are the supported shape for this class.
 
+## Search-leg degradation receipts (Delivery A)
+
+Exact focused command (non-production DB):
+
+```bash
+export SQLX_OFFLINE=true
+export DATABASE_URL="postgres://kengram:kengram@localhost:5432/kengram"
+cargo test -p kengram-mcp --lib degradation:: -- --test-threads=1
+cargo test -p kengram-mcp --lib search::tests::search_thoughts_degrades_when_embedder_fails -- --exact --test-threads=1
+cargo test -p kengram-mcp --lib search::tests::search_thoughts_soft_fails_timed_out_fts_leg -- --exact --test-threads=1
+cargo test -p kengram-cli --bin kengram health:: -- --test-threads=1
+```
+
+Success: each selected command ends with `0 failed` and a positive `passed` count. Health must expose the full fixed leg×reason matrix in enum order.
+

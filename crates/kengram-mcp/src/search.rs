@@ -18,6 +18,10 @@
 //! carries the thought's `tags` so consumers can show / threshold by them
 //! without a follow-up `get_thought`.
 
+use crate::degradation::{
+    DegradationFallback, DegradationReason, SearchCounters, SearchDegradation, SearchLeg,
+    reason_from_embedder, reason_from_reranker, record_degradation,
+};
 use kengram_core::{
     DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Embedder, EmbeddingModel, EmbeddingStatus, Hit,
     LinkDirection, Metadata, RelationKind, Scope, Source, SparseEmbedder, Tags, Thought, ThoughtId,
@@ -83,6 +87,8 @@ pub struct SearchRuntimeOptions {
     pub contextual_retrieval_enabled: bool,
     pub contextual_chunk_vector_enabled: bool,
     pub contextual_chunk_fts_enabled: bool,
+    /// Process-local degradation counters (Delivery A). None in pure unit helpers.
+    pub counters: Option<std::sync::Arc<SearchCounters>>,
 }
 
 impl Default for SearchRuntimeOptions {
@@ -102,6 +108,7 @@ impl Default for SearchRuntimeOptions {
             contextual_retrieval_enabled: false,
             contextual_chunk_vector_enabled: false,
             contextual_chunk_fts_enabled: false,
+            counters: None,
         }
     }
 }
@@ -226,6 +233,8 @@ pub struct SearchResponse {
     pub results: Vec<SearchHit>,
     pub vector_search_available: bool,
     pub rerank_used: bool,
+    /// Authoritative per-leg degradation receipt (Delivery A). Empty on healthy search.
+    pub degradations: Vec<crate::degradation::SearchDegradation>,
     pub profile: Option<SearchProfile>,
 }
 
@@ -465,6 +474,12 @@ async fn search_thoughts_with_tuning(
 ) -> Result<SearchResponse, ReadError> {
     let total_started = Instant::now();
     let include_profile = request.include_profile;
+    let counters = runtime.counters.clone();
+    if let Some(c) = counters.as_ref() {
+        c.record_request();
+    }
+    let search_seq = counters.as_ref().map(|c| c.next_search_seq()).unwrap_or(0);
+    let mut degradations: Vec<SearchDegradation> = Vec::new();
     let mut profile = SearchProfile {
         parent_resolution_mode: "sql_join_in_retrieval_legs",
         ..SearchProfile::default()
@@ -545,6 +560,25 @@ async fn search_thoughts_with_tuning(
         ),
         Err(e) => {
             tracing::warn!(error = %e, "embedder failed to embed query; falling back to lexical only");
+            let reason = reason_from_embedder(&e);
+            let timeout_ms = match &e {
+                kengram_core::EmbedderError::Timeout { seconds } => {
+                    Some(seconds.saturating_mul(1000))
+                }
+                _ => None,
+            };
+            record_degradation(
+                counters.as_ref(),
+                &mut degradations,
+                SearchDegradation::new(
+                    SearchLeg::QueryEmbedding,
+                    reason,
+                    DegradationFallback::LexicalOnly,
+                    timeout_ms,
+                    1,
+                ),
+                search_seq,
+            );
             None
         }
     };
@@ -571,6 +605,18 @@ async fn search_thoughts_with_tuning(
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "vector kNN query failed; falling back to lexical only");
+                        record_degradation(
+                            counters.as_ref(),
+                            &mut degradations,
+                            SearchDegradation::new(
+                                SearchLeg::ThoughtVector,
+                                DegradationReason::Storage,
+                                DegradationFallback::AvailableSearchLegs,
+                                None,
+                                1,
+                            ),
+                            search_seq,
+                        );
                         vec![]
                     }
                 };
@@ -594,6 +640,18 @@ async fn search_thoughts_with_tuning(
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "artifact-chunk vector kNN query failed; continuing without chunk vector hits");
+                            record_degradation(
+                                counters.as_ref(),
+                                &mut degradations,
+                                SearchDegradation::new(
+                                    SearchLeg::ChunkVector,
+                                    DegradationReason::Storage,
+                                    DegradationFallback::AvailableSearchLegs,
+                                    None,
+                                    1,
+                                ),
+                                search_seq,
+                            );
                             vec![]
                         }
                     };
@@ -621,6 +679,18 @@ async fn search_thoughts_with_tuning(
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "contextual-chunk vector kNN query failed; continuing without contextual vector hits");
+                            record_degradation(
+                                counters.as_ref(),
+                                &mut degradations,
+                                SearchDegradation::new(
+                                    SearchLeg::ContextualChunkVector,
+                                    DegradationReason::Storage,
+                                    DegradationFallback::AvailableSearchLegs,
+                                    None,
+                                    1,
+                                ),
+                                search_seq,
+                            );
                             vec![]
                         }
                     };
@@ -702,6 +772,10 @@ async fn search_thoughts_with_tuning(
         scope_prefix_filter,
         lexical_top_k,
         lexical_timeout_ms,
+        counters.as_ref(),
+        &mut degradations,
+        search_seq,
+        SearchLeg::ThoughtFts,
     )
     .await;
     profile.thought_fts_ms = elapsed_ms(thought_fts_started);
@@ -715,6 +789,10 @@ async fn search_thoughts_with_tuning(
             scope_prefix_filter,
             lexical_top_k,
             lexical_timeout_ms,
+            counters.as_ref(),
+            &mut degradations,
+            search_seq,
+            SearchLeg::ChunkFts,
         )
         .await;
         profile.chunk_fts_ms = elapsed_ms(chunk_fts_started);
@@ -732,6 +810,10 @@ async fn search_thoughts_with_tuning(
             scope_prefix_filter,
             lexical_top_k,
             lexical_timeout_ms,
+            counters.as_ref(),
+            &mut degradations,
+            search_seq,
+            SearchLeg::ContextualChunkFts,
         )
         .await;
         profile.contextual_chunk_fts_ms = elapsed_ms(contextual_fts_started);
@@ -750,6 +832,10 @@ async fn search_thoughts_with_tuning(
             scope_prefix_filter,
             lexical_top_k,
             lexical_timeout_ms,
+            counters.as_ref(),
+            &mut degradations,
+            search_seq,
+            SearchLeg::PairwiseChunkFts,
         )
         .await;
         profile.chunk_pairwise_fts_ms = elapsed_ms(chunk_pairwise_started);
@@ -771,6 +857,10 @@ async fn search_thoughts_with_tuning(
             scope_prefix_filter,
             lexical_top_k,
             lexical_timeout_ms,
+            counters.as_ref(),
+            &mut degradations,
+            search_seq,
+            SearchLeg::DomainScope,
         )
         .await;
         profile.domain_scope_ms = elapsed_ms(domain_started);
@@ -784,6 +874,10 @@ async fn search_thoughts_with_tuning(
             scope_prefix_filter,
             lexical_top_k,
             lexical_timeout_ms,
+            counters.as_ref(),
+            &mut degradations,
+            search_seq,
+            SearchLeg::TagFacet,
         )
         .await;
         profile.tag_facet_ms = elapsed_ms(tag_started);
@@ -807,6 +901,9 @@ async fn search_thoughts_with_tuning(
             lexical_top_k,
             lexical_timeout_ms,
             &mut profile,
+            counters.as_ref(),
+            &mut degradations,
+            search_seq,
         )
         .await
     } else {
@@ -928,6 +1025,10 @@ async fn search_thoughts_with_tuning(
                 &mut fused,
                 effective_candidate_pool,
                 chunk_serving_enabled,
+                counters.as_ref(),
+                &mut degradations,
+                search_seq,
+                None,
             )
             .await
         }
@@ -945,10 +1046,16 @@ async fn search_thoughts_with_tuning(
     profile.result_count = results.len();
     profile.total_ms = elapsed_ms(total_started);
 
+    if !degradations.is_empty() {
+        if let Some(c) = counters.as_ref() {
+            c.record_degraded_request();
+        }
+    }
     Ok(SearchResponse {
         results,
         vector_search_available,
         rerank_used,
+        degradations,
         profile: include_profile.then_some(profile),
     })
 }
@@ -1052,6 +1159,9 @@ async fn collect_expansion_rankings(
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
     profile: &mut SearchProfile,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
 ) -> ExpansionRankings {
     let inputs = plan.generated_inputs();
     if inputs.is_empty() {
@@ -1131,6 +1241,10 @@ async fn collect_expansion_rankings(
             scope_prefix_filter,
             lexical_top_k,
             lexical_timeout_ms,
+            counters,
+            degradations,
+            search_seq,
+            SearchLeg::ExpansionThoughtFts,
         )
         .await;
         profile.query_expansion_thought_fts_hits += thought_hits.len();
@@ -1145,6 +1259,10 @@ async fn collect_expansion_rankings(
                 scope_prefix_filter,
                 lexical_top_k,
                 lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                SearchLeg::ExpansionChunkFts,
             )
             .await;
             profile.query_expansion_chunk_fts_hits += chunk_hits.len();
@@ -1341,6 +1459,39 @@ fn search_hit_from_core_hit(
     }
 }
 
+fn storage_leg_fail_open(
+    e: &kengram_storage::StorageError,
+    leg: SearchLeg,
+    lexical_timeout_ms: u64,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    failed_attempts: u32,
+) {
+    let reason = if e.is_query_canceled() {
+        DegradationReason::Timeout
+    } else {
+        DegradationReason::Storage
+    };
+    let timeout_ms = if e.is_query_canceled() {
+        Some(lexical_timeout_ms)
+    } else {
+        None
+    };
+    record_degradation(
+        counters,
+        degradations,
+        SearchDegradation::new(
+            leg,
+            reason,
+            DegradationFallback::AvailableSearchLegs,
+            timeout_ms,
+            failed_attempts,
+        ),
+        search_seq,
+    );
+}
+
 async fn bounded_fts_hits(
     pool: &PgPool,
     query: &str,
@@ -1348,6 +1499,10 @@ async fn bounded_fts_hits(
     scope_prefix_filter: Option<&str>,
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    leg: SearchLeg,
 ) -> Vec<Hit> {
     match kengram_storage::search_fts_bounded(
         pool,
@@ -1365,7 +1520,16 @@ async fn bounded_fts_hits(
                 error = %e,
                 query_canceled = e.is_query_canceled(),
                 timeout_ms = lexical_timeout_ms,
-                "bounded FTS query failed; continuing with available search legs only",
+                "bounded search leg failed; continuing with available search legs only",
+            );
+            storage_leg_fail_open(
+                &e,
+                leg,
+                lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                1,
             );
             vec![]
         }
@@ -1379,6 +1543,10 @@ async fn bounded_domain_scope_hits(
     scope_prefix_filter: Option<&str>,
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    leg: SearchLeg,
 ) -> Vec<Hit> {
     match kengram_storage::search_domain_scope_aliases_bounded(
         pool,
@@ -1396,7 +1564,16 @@ async fn bounded_domain_scope_hits(
                 error = %e,
                 query_canceled = e.is_query_canceled(),
                 timeout_ms = lexical_timeout_ms,
-                "bounded domain-scope candidate leg failed; continuing with baseline search legs",
+                "bounded search leg failed; continuing with available search legs only",
+            );
+            storage_leg_fail_open(
+                &e,
+                leg,
+                lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                1,
             );
             vec![]
         }
@@ -1410,6 +1587,10 @@ async fn bounded_tag_facet_hits(
     scope_prefix_filter: Option<&str>,
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    leg: SearchLeg,
 ) -> Vec<Hit> {
     match kengram_storage::search_tag_facets_bounded(
         pool,
@@ -1427,7 +1608,16 @@ async fn bounded_tag_facet_hits(
                 error = %e,
                 query_canceled = e.is_query_canceled(),
                 timeout_ms = lexical_timeout_ms,
-                "bounded tag-facet candidate leg failed; continuing with baseline search legs",
+                "bounded search leg failed; continuing with available search legs only",
+            );
+            storage_leg_fail_open(
+                &e,
+                leg,
+                lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                1,
             );
             vec![]
         }
@@ -1441,6 +1631,10 @@ async fn bounded_artifact_chunk_fts_hits(
     scope_prefix_filter: Option<&str>,
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    leg: SearchLeg,
 ) -> Vec<Hit> {
     match kengram_storage::search_artifact_chunks_fts_bounded(
         pool,
@@ -1458,7 +1652,16 @@ async fn bounded_artifact_chunk_fts_hits(
                 error = %e,
                 query_canceled = e.is_query_canceled(),
                 timeout_ms = lexical_timeout_ms,
-                "bounded artifact-chunk FTS query failed; continuing with available search legs only",
+                "bounded search leg failed; continuing with available search legs only",
+            );
+            storage_leg_fail_open(
+                &e,
+                leg,
+                lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                1,
             );
             vec![]
         }
@@ -1472,6 +1675,10 @@ async fn bounded_artifact_chunk_context_fts_hits(
     scope_prefix_filter: Option<&str>,
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    leg: SearchLeg,
 ) -> Vec<Hit> {
     match kengram_storage::search_artifact_chunk_contexts_fts_bounded(
         pool,
@@ -1489,7 +1696,16 @@ async fn bounded_artifact_chunk_context_fts_hits(
                 error = %e,
                 query_canceled = e.is_query_canceled(),
                 timeout_ms = lexical_timeout_ms,
-                "bounded contextual-chunk FTS query failed; continuing with available search legs only",
+                "bounded search leg failed; continuing with available search legs only",
+            );
+            storage_leg_fail_open(
+                &e,
+                leg,
+                lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                1,
             );
             vec![]
         }
@@ -1503,7 +1719,12 @@ async fn bounded_pairwise_artifact_chunk_fts_hits(
     scope_prefix_filter: Option<&str>,
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    leg: SearchLeg,
 ) -> Vec<Hit> {
+    let _leg = leg; // subqueries record via PairwiseChunkFts at call sites of storage
     let subqueries = pairwise_subqueries(query);
     if subqueries.is_empty() {
         return Vec::new();
@@ -1518,6 +1739,10 @@ async fn bounded_pairwise_artifact_chunk_fts_hits(
             scope_prefix_filter,
             PAIRWISE_PER_SUBQUERY_TOP_K,
             lexical_timeout_ms,
+            counters,
+            degradations,
+            search_seq,
+            SearchLeg::PairwiseChunkFts,
         )
         .await;
         if !hits.is_empty() {
@@ -1875,6 +2100,10 @@ async fn apply_rerank_to_thought_hits(
     hits: &mut Vec<kengram_core::Hit>,
     candidate_pool: usize,
     exact_identifier_boost_enabled: bool,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    rerank_timeout_ms: Option<u64>,
 ) -> bool {
     if hits.is_empty() {
         return false;
@@ -1896,6 +2125,18 @@ async fn apply_rerank_to_thought_hits(
                 error = %e,
                 transient = e.is_transient(),
                 "reranker failed; falling back to RRF + recency order",
+            );
+            record_degradation(
+                counters,
+                degradations,
+                SearchDegradation::new(
+                    SearchLeg::Rerank,
+                    reason_from_reranker(&e),
+                    DegradationFallback::RrfRecency,
+                    rerank_timeout_ms,
+                    1,
+                ),
+                search_seq,
             );
             return false;
         }
@@ -2248,7 +2489,21 @@ mod tests {
             test_hit("plain first candidate"),
             test_hit("KGR999 exact id"),
         ];
-        assert!(apply_rerank_to_thought_hits(&reranker, query, &mut flag_off, 2, false).await);
+        assert!({
+            let mut d = Vec::new();
+            apply_rerank_to_thought_hits(
+                &reranker,
+                query,
+                &mut flag_off,
+                2,
+                false,
+                None,
+                &mut d,
+                0,
+                None,
+            )
+            .await
+        });
         assert_eq!(flag_off[0].thought.content, "plain first candidate");
         assert_eq!(flag_off[1].thought.content, "KGR999 exact id");
 
@@ -2256,7 +2511,21 @@ mod tests {
             test_hit("plain first candidate"),
             test_hit("KGR999 exact id"),
         ];
-        assert!(apply_rerank_to_thought_hits(&reranker, query, &mut flag_on, 2, true).await);
+        assert!({
+            let mut d = Vec::new();
+            apply_rerank_to_thought_hits(
+                &reranker,
+                query,
+                &mut flag_on,
+                2,
+                true,
+                None,
+                &mut d,
+                0,
+                None,
+            )
+            .await
+        });
         assert_eq!(flag_on[0].thought.content, "KGR999 exact id");
         assert_eq!(flag_on[1].thought.content, "plain first candidate");
     }
@@ -2510,6 +2779,13 @@ mod tests {
         .unwrap();
 
         assert!(!resp.vector_search_available);
+        assert_eq!(resp.degradations.len(), 1);
+        assert_eq!(resp.degradations[0].leg, SearchLeg::QueryEmbedding);
+        assert_eq!(resp.degradations[0].reason, DegradationReason::Unreachable);
+        assert_eq!(
+            resp.degradations[0].fallback,
+            DegradationFallback::LexicalOnly
+        );
         assert_eq!(resp.results.len(), 1);
         assert_eq!(resp.results[0].thought_id, id);
     }
@@ -2629,8 +2905,22 @@ mod tests {
         }
 
         let started = std::time::Instant::now();
-        let lexical_hits =
-            bounded_fts_hits(&pool, needle, None, None, DEFAULT_LEXICAL_TOP_K, 1).await;
+        let lexical_hits = {
+            let mut deg = Vec::new();
+            bounded_fts_hits(
+                &pool,
+                needle,
+                None,
+                None,
+                DEFAULT_LEXICAL_TOP_K,
+                1,
+                None,
+                &mut deg,
+                0,
+                SearchLeg::ThoughtFts,
+            )
+            .await
+        };
         assert!(
             started.elapsed() < std::time::Duration::from_millis(800),
             "timed-out FTS leg should return inside its budget"
