@@ -159,3 +159,36 @@ No marker, any skip/count mismatch, or nonzero exit is failure.
     Judged gate is this registered supersession E2E only (A8 scoped: unprovisioned full kengram-mcp --lib 42501 producer_principal_unmapped is diagnostic, not pass/fail). B4: case_10b requires exact SQLSTATE P0001 and exact message supersession_old_thought_unavailable. B5: zero-receipt down removes supersession_receipt_json_key_count(jsonb) with pre-proven residue.
   Terminal marker: `PASS source-event-supersession selected=<n> executed=<n> failed=0 skipped=0`
   (exact selected/executed equality; zero failed/ignored; cargo must have run).
+
+## Migration 0036 multi-DB down (cluster-global role)
+
+Exact disposable proof (never production, never the shared host Postgres cluster):
+
+```bash
+./scripts/test-migration-0036-multi-db-down.sh
+```
+
+**Self-contained:** starts `pgvector/pgvector:pg16` via Docker (same image family as
+`scripts/test-migration-0035-reconciliation.sh`), creates two databases inside that
+container, migrates both through 0036, and provisions vector via the image (no host
+Homebrew pgvector prerequisite). Requires `docker` + network pull of the image on
+first run.
+
+Proof cases:
+1. Watched RED — legacy unconditional `DROP ROLE` fails with a dependency class
+2. Guarded down on DB-A while DB-B still has 0036 — A clean, B function + role retained
+3. Guarded down on DB-B — role removed when last cluster dependent is gone
+
+Terminal marker (required):
+
+```text
+PASS kengram-0036-multi-db-down selected=3 executed=3 failed=0 skipped=0
+```
+
+Also: `bash scripts/test-source-event-supersession.sh` (single-DB supersession E2E
+including case_14 zero-receipt down).
+
+**Note:** do not edit `migrations/0036_argus_source_event_supersession_transaction.sql`
+after it has been applied in production — SQLx records the checksum; down-file-only
+repairs are the supported shape for this class.
+
