@@ -1,6 +1,6 @@
 # PR20 spike-certified freeze
 
-- certified_head: 
+- certified_head: `b04d1d51db199bbe059212efbf0bf655dc485435`
 - code_head_F1: `dc90f56cb97b5568b1c66c12c080928351461e72`
 - certifier: spike
 - when: `2026-08-09T18:34:06Z`
