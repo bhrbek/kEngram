@@ -12,6 +12,7 @@ mod config;
 mod contextual;
 mod corpus_hygiene_security;
 mod eval;
+mod health;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
@@ -610,6 +611,11 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     let contextual_chunk_vector_enabled = config.search.contextual_chunk_vector_effective();
     let contextual_chunk_fts_enabled = config.search.contextual_chunk_fts_effective();
     let (graph_relations, graph_direction) = parse_graph_runtime_config(&config.search)?;
+    config
+        .search
+        .validate_lexical_timeouts()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let search_counters = std::sync::Arc::new(kengram_mcp::degradation::SearchCounters::new());
     let query_expansion_runtime = SearchRuntimeOptions {
         query_expansion_enabled: config.search.query_expansion_effective(),
         hyde_enabled: config.search.hyde_effective(),
@@ -625,6 +631,15 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
         contextual_retrieval_enabled,
         contextual_chunk_vector_enabled,
         contextual_chunk_fts_enabled,
+        counters: Some(search_counters.clone()),
+        rerank_timeout_ms: Some(config.reranker.timeout_seconds.saturating_mul(1000)),
+        thought_fts_timeout_ms: config.search.thought_fts_timeout_ms,
+        chunk_fts_timeout_ms: config.search.chunk_fts_timeout_ms,
+        contextual_chunk_fts_timeout_ms: config.search.contextual_chunk_fts_timeout_ms,
+        pairwise_chunk_fts_timeout_ms: config.search.pairwise_chunk_fts_timeout_ms,
+        domain_scope_timeout_ms: config.search.domain_scope_timeout_ms,
+        tag_facet_timeout_ms: config.search.tag_facet_timeout_ms,
+        expansion_fts_timeout_ms: config.search.expansion_fts_timeout_ms,
     };
     tracing::info!(
         chunk_serving_enabled,
@@ -688,7 +703,24 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     let mcp_service =
         StreamableHttpService::new(factory, LocalSessionManager::default().into(), http_cfg);
 
-    let app = axum::Router::new().nest_service("/mcp", mcp_service);
+    let mut effective_timeouts = config.search.effective_timeouts_json();
+    if let Some(obj) = effective_timeouts.as_object_mut() {
+        obj.insert(
+            "embedder_timeout_seconds".to_string(),
+            serde_json::json!(config.embedder.timeout_seconds),
+        );
+        obj.insert(
+            "reranker_timeout_seconds".to_string(),
+            serde_json::json!(config.reranker.timeout_seconds),
+        );
+    }
+    let health_state = health::HealthState {
+        counters: search_counters.clone(),
+        effective_timeouts,
+    };
+    let app = health::mount_health(axum::Router::new())
+        .with_state(health_state)
+        .nest_service("/mcp", mcp_service);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding HTTP server to {bind}"))?;

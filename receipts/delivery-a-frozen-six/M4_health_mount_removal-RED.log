@@ -1,0 +1,62 @@
+$ cargo test -p kengram-cli --bin kengram health::tests::health_route_via_axum_router -- --exact --test-threads=1 --nocapture
+exit=101
+
+--- stdout ---
+
+running 1 test
+test health::tests::health_route_via_axum_router ... FAILED
+
+failures:
+
+failures:
+    health::tests::health_route_via_axum_router
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 96 filtered out; finished in 0.01s
+
+
+
+--- stderr ---
+   Compiling kengram-mcp v0.2.0 (/Volumes/devdrive1/worktrees/kengram-diesel-pr20-ceremony-20260809/crates/kengram-mcp)
+   Compiling kengram-cli v0.2.0 (/Volumes/devdrive1/worktrees/kengram-diesel-pr20-ceremony-20260809/crates/kengram-cli)
+warning: fields `counters` and `effective_timeouts` are never read
+  --> crates/kengram-cli/src/health.rs:11:9
+   |
+10 | pub struct HealthState {
+   |            ----------- fields in this struct
+11 |     pub counters: Arc<SearchCounters>,
+   |         ^^^^^^^^
+12 |     pub effective_timeouts: serde_json::Value,
+   |         ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `HealthState` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `HealthResponse` is never constructed
+  --> crates/kengram-cli/src/health.rs:16:12
+   |
+16 | pub struct HealthResponse {
+   |            ^^^^^^^^^^^^^^
+
+warning: struct `HealthSearchBody` is never constructed
+  --> crates/kengram-cli/src/health.rs:24:12
+   |
+24 | pub struct HealthSearchBody {
+   |            ^^^^^^^^^^^^^^^^
+
+warning: function `health_handler` is never used
+  --> crates/kengram-cli/src/health.rs:38:14
+   |
+38 | pub async fn health_handler(State(state): State<HealthState>) -> Json<HealthResponse> {
+   |              ^^^^^^^^^^^^^^
+
+warning: `kengram-cli` (bin "kengram" test) generated 4 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.04s
+     Running unittests src/main.rs (target/debug/deps/kengram-3c77dd11706b3ffa)
+
+thread 'health::tests::health_route_via_axum_router' (1312937720) panicked at crates/kengram-cli/src/health.rs:138:9:
+assertion `left == right` failed: KENGRAM_DELIVERY_A_RED:V4_health_route_mount
+  left: 404
+ right: 200
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p kengram-cli --bin kengram`
+

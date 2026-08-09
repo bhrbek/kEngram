@@ -1,0 +1,17 @@
+$ cargo test -p kengram-mcp --lib degradation::tests::record_increments_exact_cell -- --exact --test-threads=1 --nocapture
+exit=0
+
+--- stdout ---
+
+running 1 test
+test degradation::tests::record_increments_exact_cell ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 233 filtered out; finished in 0.00s
+
+
+
+--- stderr ---
+   Compiling kengram-mcp v0.2.0 (/Volumes/devdrive1/worktrees/kengram-diesel-pr20-ceremony-20260809/crates/kengram-mcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.49s
+     Running unittests src/lib.rs (target/debug/deps/kengram_mcp-e9571d5513c81bd6)
+

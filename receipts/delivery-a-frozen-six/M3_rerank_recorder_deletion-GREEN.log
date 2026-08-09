@@ -1,0 +1,17 @@
+$ cargo test -p kengram-mcp --lib search::tests::search_thoughts_rerank_timeout_via_tei_wiremock -- --exact --test-threads=1 --nocapture
+exit=0
+
+--- stdout ---
+
+running 1 test
+test search::tests::search_thoughts_rerank_timeout_via_tei_wiremock ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 233 filtered out; finished in 1.29s
+
+
+
+--- stderr ---
+   Compiling kengram-mcp v0.2.0 (/Volumes/devdrive1/worktrees/kengram-diesel-pr20-ceremony-20260809/crates/kengram-mcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.26s
+     Running unittests src/lib.rs (target/debug/deps/kengram_mcp-e9571d5513c81bd6)
+

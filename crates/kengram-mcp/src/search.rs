@@ -18,6 +18,10 @@
 //! carries the thought's `tags` so consumers can show / threshold by them
 //! without a follow-up `get_thought`.
 
+use crate::degradation::{
+    DegradationFallback, DegradationReason, SearchCounters, SearchDegradation, SearchLeg,
+    reason_from_embedder, reason_from_reranker, record_degradation,
+};
 use kengram_core::{
     DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Embedder, EmbeddingModel, EmbeddingStatus, Hit,
     LinkDirection, Metadata, RelationKind, Scope, Source, SparseEmbedder, Tags, Thought, ThoughtId,
@@ -83,6 +87,18 @@ pub struct SearchRuntimeOptions {
     pub contextual_retrieval_enabled: bool,
     pub contextual_chunk_vector_enabled: bool,
     pub contextual_chunk_fts_enabled: bool,
+    /// Process-local degradation counters (Delivery A). None in pure unit helpers.
+    pub counters: Option<std::sync::Arc<SearchCounters>>,
+    /// Configured reranker HTTP timeout (ms) for degradation receipt accuracy.
+    pub rerank_timeout_ms: Option<u64>,
+    /// Per-leg lexical statement timeouts (ms). Defaults preserve 300 ms.
+    pub thought_fts_timeout_ms: u64,
+    pub chunk_fts_timeout_ms: u64,
+    pub contextual_chunk_fts_timeout_ms: u64,
+    pub pairwise_chunk_fts_timeout_ms: u64,
+    pub domain_scope_timeout_ms: u64,
+    pub tag_facet_timeout_ms: u64,
+    pub expansion_fts_timeout_ms: u64,
 }
 
 impl Default for SearchRuntimeOptions {
@@ -102,6 +118,15 @@ impl Default for SearchRuntimeOptions {
             contextual_retrieval_enabled: false,
             contextual_chunk_vector_enabled: false,
             contextual_chunk_fts_enabled: false,
+            counters: None,
+            rerank_timeout_ms: None,
+            thought_fts_timeout_ms: DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            chunk_fts_timeout_ms: DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            contextual_chunk_fts_timeout_ms: DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            pairwise_chunk_fts_timeout_ms: DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            domain_scope_timeout_ms: DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            tag_facet_timeout_ms: DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            expansion_fts_timeout_ms: DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
         }
     }
 }
@@ -226,6 +251,8 @@ pub struct SearchResponse {
     pub results: Vec<SearchHit>,
     pub vector_search_available: bool,
     pub rerank_used: bool,
+    /// Authoritative per-leg degradation receipt (Delivery A). Empty on healthy search.
+    pub degradations: Vec<crate::degradation::SearchDegradation>,
     pub profile: Option<SearchProfile>,
 }
 
@@ -465,6 +492,58 @@ async fn search_thoughts_with_tuning(
 ) -> Result<SearchResponse, ReadError> {
     let total_started = Instant::now();
     let include_profile = request.include_profile;
+    let counters = runtime.counters.clone();
+    if let Some(c) = counters.as_ref() {
+        c.record_request();
+    }
+    let search_seq = counters.as_ref().map(|c| c.next_search_seq()).unwrap_or(0);
+    let mut degradations: Vec<SearchDegradation> = Vec::new();
+    // Route per-leg lexical budgets from runtime. When all seven still equal the
+    // compile-time default, honor the legacy single lexical_timeout_ms argument
+    // (tests override that way). Production sets unequal values on runtime.
+    let lexical_all_default = runtime.thought_fts_timeout_ms
+        == DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS
+        && runtime.chunk_fts_timeout_ms == DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS
+        && runtime.contextual_chunk_fts_timeout_ms == DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS
+        && runtime.pairwise_chunk_fts_timeout_ms == DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS
+        && runtime.domain_scope_timeout_ms == DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS
+        && runtime.tag_facet_timeout_ms == DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS
+        && runtime.expansion_fts_timeout_ms == DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS;
+    let thought_fts_timeout_ms = if lexical_all_default {
+        lexical_timeout_ms
+    } else {
+        runtime.thought_fts_timeout_ms
+    };
+    let chunk_fts_timeout_ms = if lexical_all_default {
+        lexical_timeout_ms
+    } else {
+        runtime.chunk_fts_timeout_ms
+    };
+    let contextual_chunk_fts_timeout_ms = if lexical_all_default {
+        lexical_timeout_ms
+    } else {
+        runtime.contextual_chunk_fts_timeout_ms
+    };
+    let pairwise_chunk_fts_timeout_ms = if lexical_all_default {
+        lexical_timeout_ms
+    } else {
+        runtime.pairwise_chunk_fts_timeout_ms
+    };
+    let domain_scope_timeout_ms = if lexical_all_default {
+        lexical_timeout_ms
+    } else {
+        runtime.domain_scope_timeout_ms
+    };
+    let tag_facet_timeout_ms = if lexical_all_default {
+        lexical_timeout_ms
+    } else {
+        runtime.tag_facet_timeout_ms
+    };
+    let expansion_fts_timeout_ms = if lexical_all_default {
+        lexical_timeout_ms
+    } else {
+        runtime.expansion_fts_timeout_ms
+    };
     let mut profile = SearchProfile {
         parent_resolution_mode: "sql_join_in_retrieval_legs",
         ..SearchProfile::default()
@@ -532,6 +611,9 @@ async fn search_thoughts_with_tuning(
         &runtime,
         &query,
         &mut profile,
+        counters.as_ref(),
+        &mut degradations,
+        search_seq,
     )
     .await;
 
@@ -545,6 +627,25 @@ async fn search_thoughts_with_tuning(
         ),
         Err(e) => {
             tracing::warn!(error = %e, "embedder failed to embed query; falling back to lexical only");
+            let reason = reason_from_embedder(&e);
+            let timeout_ms = match &e {
+                kengram_core::EmbedderError::Timeout { seconds } => {
+                    Some(seconds.saturating_mul(1000))
+                }
+                _ => None,
+            };
+            record_degradation(
+                counters.as_ref(),
+                &mut degradations,
+                SearchDegradation::new(
+                    SearchLeg::QueryEmbedding,
+                    reason,
+                    DegradationFallback::LexicalOnly,
+                    timeout_ms,
+                    1,
+                ),
+                search_seq,
+            );
             None
         }
     };
@@ -571,6 +672,18 @@ async fn search_thoughts_with_tuning(
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "vector kNN query failed; falling back to lexical only");
+                        record_degradation(
+                            counters.as_ref(),
+                            &mut degradations,
+                            SearchDegradation::new(
+                                SearchLeg::ThoughtVector,
+                                DegradationReason::Storage,
+                                DegradationFallback::AvailableSearchLegs,
+                                None,
+                                1,
+                            ),
+                            search_seq,
+                        );
                         vec![]
                     }
                 };
@@ -594,6 +707,18 @@ async fn search_thoughts_with_tuning(
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "artifact-chunk vector kNN query failed; continuing without chunk vector hits");
+                            record_degradation(
+                                counters.as_ref(),
+                                &mut degradations,
+                                SearchDegradation::new(
+                                    SearchLeg::ChunkVector,
+                                    DegradationReason::Storage,
+                                    DegradationFallback::AvailableSearchLegs,
+                                    None,
+                                    1,
+                                ),
+                                search_seq,
+                            );
                             vec![]
                         }
                     };
@@ -621,6 +746,18 @@ async fn search_thoughts_with_tuning(
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "contextual-chunk vector kNN query failed; continuing without contextual vector hits");
+                            record_degradation(
+                                counters.as_ref(),
+                                &mut degradations,
+                                SearchDegradation::new(
+                                    SearchLeg::ContextualChunkVector,
+                                    DegradationReason::Storage,
+                                    DegradationFallback::AvailableSearchLegs,
+                                    None,
+                                    1,
+                                ),
+                                search_seq,
+                            );
                             vec![]
                         }
                     };
@@ -701,7 +838,11 @@ async fn search_thoughts_with_tuning(
         scope_filter,
         scope_prefix_filter,
         lexical_top_k,
-        lexical_timeout_ms,
+        thought_fts_timeout_ms,
+        counters.as_ref(),
+        &mut degradations,
+        search_seq,
+        SearchLeg::ThoughtFts,
     )
     .await;
     profile.thought_fts_ms = elapsed_ms(thought_fts_started);
@@ -714,7 +855,11 @@ async fn search_thoughts_with_tuning(
             scope_filter,
             scope_prefix_filter,
             lexical_top_k,
-            lexical_timeout_ms,
+            chunk_fts_timeout_ms,
+            counters.as_ref(),
+            &mut degradations,
+            search_seq,
+            SearchLeg::ChunkFts,
         )
         .await;
         profile.chunk_fts_ms = elapsed_ms(chunk_fts_started);
@@ -731,7 +876,11 @@ async fn search_thoughts_with_tuning(
             scope_filter,
             scope_prefix_filter,
             lexical_top_k,
-            lexical_timeout_ms,
+            contextual_chunk_fts_timeout_ms,
+            counters.as_ref(),
+            &mut degradations,
+            search_seq,
+            SearchLeg::ContextualChunkFts,
         )
         .await;
         profile.contextual_chunk_fts_ms = elapsed_ms(contextual_fts_started);
@@ -749,7 +898,11 @@ async fn search_thoughts_with_tuning(
             scope_filter,
             scope_prefix_filter,
             lexical_top_k,
-            lexical_timeout_ms,
+            pairwise_chunk_fts_timeout_ms,
+            counters.as_ref(),
+            &mut degradations,
+            search_seq,
+            SearchLeg::PairwiseChunkFts,
         )
         .await;
         profile.chunk_pairwise_fts_ms = elapsed_ms(chunk_pairwise_started);
@@ -770,7 +923,11 @@ async fn search_thoughts_with_tuning(
             scope_filter,
             scope_prefix_filter,
             lexical_top_k,
-            lexical_timeout_ms,
+            domain_scope_timeout_ms,
+            counters.as_ref(),
+            &mut degradations,
+            search_seq,
+            SearchLeg::DomainScope,
         )
         .await;
         profile.domain_scope_ms = elapsed_ms(domain_started);
@@ -783,7 +940,11 @@ async fn search_thoughts_with_tuning(
             scope_filter,
             scope_prefix_filter,
             lexical_top_k,
-            lexical_timeout_ms,
+            tag_facet_timeout_ms,
+            counters.as_ref(),
+            &mut degradations,
+            search_seq,
+            SearchLeg::TagFacet,
         )
         .await;
         profile.tag_facet_ms = elapsed_ms(tag_started);
@@ -805,8 +966,11 @@ async fn search_thoughts_with_tuning(
             scope_filter,
             scope_prefix_filter,
             lexical_top_k,
-            lexical_timeout_ms,
+            expansion_fts_timeout_ms,
             &mut profile,
+            counters.as_ref(),
+            &mut degradations,
+            search_seq,
         )
         .await
     } else {
@@ -928,6 +1092,10 @@ async fn search_thoughts_with_tuning(
                 &mut fused,
                 effective_candidate_pool,
                 chunk_serving_enabled,
+                counters.as_ref(),
+                &mut degradations,
+                search_seq,
+                runtime.rerank_timeout_ms,
             )
             .await
         }
@@ -945,10 +1113,16 @@ async fn search_thoughts_with_tuning(
     profile.result_count = results.len();
     profile.total_ms = elapsed_ms(total_started);
 
+    if !degradations.is_empty() {
+        if let Some(c) = counters.as_ref() {
+            c.record_degraded_request();
+        }
+    }
     Ok(SearchResponse {
         results,
         vector_search_available,
         rerank_used,
+        degradations,
         profile: include_profile.then_some(profile),
     })
 }
@@ -980,6 +1154,9 @@ async fn build_expansion_plan(
     runtime: &SearchRuntimeOptions,
     query: &str,
     profile: &mut SearchProfile,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
 ) -> Option<ExpansionPlan> {
     if !query_expansion_enabled {
         return None;
@@ -1034,6 +1211,41 @@ async fn build_expansion_plan(
                 reason = e.reason_code(),
                 "query expansion provider failed; falling back to original-query-only retrieval",
             );
+            let reason = match &e {
+                crate::query_expansion::QueryExpansionError::Timeout { .. } => {
+                    DegradationReason::Timeout
+                }
+                crate::query_expansion::QueryExpansionError::Unreachable(_) => {
+                    DegradationReason::Unreachable
+                }
+                crate::query_expansion::QueryExpansionError::Backend { .. } => {
+                    DegradationReason::Backend
+                }
+                crate::query_expansion::QueryExpansionError::MalformedResponse(_) => {
+                    DegradationReason::Malformed
+                }
+                crate::query_expansion::QueryExpansionError::Misconfigured(_) => {
+                    DegradationReason::Misconfigured
+                }
+            };
+            let timeout_ms = match &e {
+                crate::query_expansion::QueryExpansionError::Timeout { seconds } => {
+                    Some(seconds.saturating_mul(1000))
+                }
+                _ => None,
+            };
+            record_degradation(
+                counters,
+                degradations,
+                SearchDegradation::new(
+                    SearchLeg::QueryExpansion,
+                    reason,
+                    DegradationFallback::OriginalQuery,
+                    timeout_ms,
+                    1,
+                ),
+                search_seq,
+            );
             profile.query_expansion_fallback = true;
             profile.query_expansion_fallback_reason = Some(e.reason_code().to_string());
             profile.query_expansion_ms = elapsed_ms(started);
@@ -1052,6 +1264,9 @@ async fn collect_expansion_rankings(
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
     profile: &mut SearchProfile,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
 ) -> ExpansionRankings {
     let inputs = plan.generated_inputs();
     if inputs.is_empty() {
@@ -1084,6 +1299,23 @@ async fn collect_expansion_rankings(
                             error = %e,
                             "query-expansion thought vector leg failed; continuing",
                         );
+                        let reason = if e.is_query_canceled() {
+                            DegradationReason::Timeout
+                        } else {
+                            DegradationReason::Storage
+                        };
+                        record_degradation(
+                            counters,
+                            degradations,
+                            SearchDegradation::new(
+                                SearchLeg::ExpansionThoughtVector,
+                                reason,
+                                DegradationFallback::AvailableSearchLegs,
+                                None,
+                                1,
+                            ),
+                            search_seq,
+                        );
                     }
                 }
                 if chunk_serving_enabled {
@@ -1108,6 +1340,23 @@ async fn collect_expansion_rankings(
                                 error = %e,
                                 "query-expansion chunk vector leg failed; continuing",
                             );
+                            let reason = if e.is_query_canceled() {
+                                DegradationReason::Timeout
+                            } else {
+                                DegradationReason::Storage
+                            };
+                            record_degradation(
+                                counters,
+                                degradations,
+                                SearchDegradation::new(
+                                    SearchLeg::ExpansionChunkVector,
+                                    reason,
+                                    DegradationFallback::AvailableSearchLegs,
+                                    None,
+                                    1,
+                                ),
+                                search_seq,
+                            );
                         }
                     }
                 }
@@ -1118,39 +1367,107 @@ async fn collect_expansion_rankings(
                 error = %e,
                 "embedder failed for query-expansion variants; keeping lexical expansion legs only",
             );
+            let reason = reason_from_embedder(&e);
+            let timeout_ms = match &e {
+                kengram_core::EmbedderError::Timeout { seconds } => {
+                    Some(seconds.saturating_mul(1000))
+                }
+                _ => None,
+            };
+            record_degradation(
+                counters,
+                degradations,
+                SearchDegradation::new(
+                    SearchLeg::ExpansionEmbedding,
+                    reason,
+                    DegradationFallback::AvailableSearchLegs,
+                    timeout_ms,
+                    1,
+                ),
+                search_seq,
+            );
         }
     }
     profile.query_expansion_vector_knn_ms = elapsed_ms(vector_started);
 
     let fts_started = Instant::now();
+    // Aggregate expansion FTS fan-out per logical leg before recorder (receipt N == WARN N).
+    let mut thought_fts_fails: u32 = 0;
+    let mut thought_fts_last: Option<kengram_storage::StorageError> = None;
+    let mut chunk_fts_fails: u32 = 0;
+    let mut chunk_fts_last: Option<kengram_storage::StorageError> = None;
     for input in &inputs {
-        let thought_hits = bounded_fts_hits(
+        match kengram_storage::search_fts_bounded(
             pool,
             input,
             scope_filter,
             scope_prefix_filter,
-            lexical_top_k,
+            lexical_top_k as i64,
             lexical_timeout_ms,
         )
-        .await;
-        profile.query_expansion_thought_fts_hits += thought_hits.len();
-        if !thought_hits.is_empty() {
-            out.thought_fts_rankings.push(thought_hits);
+        .await
+        {
+            Ok(hits) => {
+                profile.query_expansion_thought_fts_hits += hits.len();
+                if !hits.is_empty() {
+                    out.thought_fts_rankings.push(hits);
+                }
+            }
+            Err(e) => {
+                thought_fts_fails = thought_fts_fails.saturating_add(1);
+                thought_fts_last = Some(e);
+            }
         }
         if chunk_serving_enabled {
-            let chunk_hits = bounded_artifact_chunk_fts_hits(
+            match kengram_storage::search_artifact_chunks_fts_bounded(
                 pool,
                 input,
                 scope_filter,
                 scope_prefix_filter,
-                lexical_top_k,
+                lexical_top_k as i64,
                 lexical_timeout_ms,
             )
-            .await;
-            profile.query_expansion_chunk_fts_hits += chunk_hits.len();
-            if !chunk_hits.is_empty() {
-                out.chunk_fts_rankings.push(chunk_hits);
+            .await
+            {
+                Ok(hits) => {
+                    profile.query_expansion_chunk_fts_hits += hits.len();
+                    if !hits.is_empty() {
+                        out.chunk_fts_rankings.push(hits);
+                    }
+                }
+                Err(e) => {
+                    chunk_fts_fails = chunk_fts_fails.saturating_add(1);
+                    chunk_fts_last = Some(e);
+                }
             }
+        }
+    }
+    // Record even on mixed success+timeout: failed attempts must remain observable
+    // when another subquery produces a ranking (smith PR20 F1 mixed-success).
+    if thought_fts_fails > 0 {
+        if let Some(e) = thought_fts_last.as_ref() {
+            storage_leg_fail_open(
+                e,
+                SearchLeg::ExpansionThoughtFts,
+                lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                thought_fts_fails,
+            );
+        }
+    }
+    if chunk_fts_fails > 0 {
+        if let Some(e) = chunk_fts_last.as_ref() {
+            storage_leg_fail_open(
+                e,
+                SearchLeg::ExpansionChunkFts,
+                lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                chunk_fts_fails,
+            );
         }
     }
     profile.query_expansion_fts_ms = elapsed_ms(fts_started);
@@ -1341,6 +1658,39 @@ fn search_hit_from_core_hit(
     }
 }
 
+fn storage_leg_fail_open(
+    e: &kengram_storage::StorageError,
+    leg: SearchLeg,
+    lexical_timeout_ms: u64,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    failed_attempts: u32,
+) {
+    let reason = if e.is_query_canceled() {
+        DegradationReason::Timeout
+    } else {
+        DegradationReason::Storage
+    };
+    let timeout_ms = if e.is_query_canceled() {
+        Some(lexical_timeout_ms)
+    } else {
+        None
+    };
+    record_degradation(
+        counters,
+        degradations,
+        SearchDegradation::new(
+            leg,
+            reason,
+            DegradationFallback::AvailableSearchLegs,
+            timeout_ms,
+            failed_attempts,
+        ),
+        search_seq,
+    );
+}
+
 async fn bounded_fts_hits(
     pool: &PgPool,
     query: &str,
@@ -1348,6 +1698,10 @@ async fn bounded_fts_hits(
     scope_prefix_filter: Option<&str>,
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    leg: SearchLeg,
 ) -> Vec<Hit> {
     match kengram_storage::search_fts_bounded(
         pool,
@@ -1365,7 +1719,16 @@ async fn bounded_fts_hits(
                 error = %e,
                 query_canceled = e.is_query_canceled(),
                 timeout_ms = lexical_timeout_ms,
-                "bounded FTS query failed; continuing with available search legs only",
+                "bounded search leg failed; continuing with available search legs only",
+            );
+            storage_leg_fail_open(
+                &e,
+                leg,
+                lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                1,
             );
             vec![]
         }
@@ -1379,6 +1742,10 @@ async fn bounded_domain_scope_hits(
     scope_prefix_filter: Option<&str>,
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    leg: SearchLeg,
 ) -> Vec<Hit> {
     match kengram_storage::search_domain_scope_aliases_bounded(
         pool,
@@ -1396,7 +1763,16 @@ async fn bounded_domain_scope_hits(
                 error = %e,
                 query_canceled = e.is_query_canceled(),
                 timeout_ms = lexical_timeout_ms,
-                "bounded domain-scope candidate leg failed; continuing with baseline search legs",
+                "bounded search leg failed; continuing with available search legs only",
+            );
+            storage_leg_fail_open(
+                &e,
+                leg,
+                lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                1,
             );
             vec![]
         }
@@ -1410,6 +1786,10 @@ async fn bounded_tag_facet_hits(
     scope_prefix_filter: Option<&str>,
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    leg: SearchLeg,
 ) -> Vec<Hit> {
     match kengram_storage::search_tag_facets_bounded(
         pool,
@@ -1427,7 +1807,16 @@ async fn bounded_tag_facet_hits(
                 error = %e,
                 query_canceled = e.is_query_canceled(),
                 timeout_ms = lexical_timeout_ms,
-                "bounded tag-facet candidate leg failed; continuing with baseline search legs",
+                "bounded search leg failed; continuing with available search legs only",
+            );
+            storage_leg_fail_open(
+                &e,
+                leg,
+                lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                1,
             );
             vec![]
         }
@@ -1441,6 +1830,10 @@ async fn bounded_artifact_chunk_fts_hits(
     scope_prefix_filter: Option<&str>,
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    leg: SearchLeg,
 ) -> Vec<Hit> {
     match kengram_storage::search_artifact_chunks_fts_bounded(
         pool,
@@ -1458,7 +1851,16 @@ async fn bounded_artifact_chunk_fts_hits(
                 error = %e,
                 query_canceled = e.is_query_canceled(),
                 timeout_ms = lexical_timeout_ms,
-                "bounded artifact-chunk FTS query failed; continuing with available search legs only",
+                "bounded search leg failed; continuing with available search legs only",
+            );
+            storage_leg_fail_open(
+                &e,
+                leg,
+                lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                1,
             );
             vec![]
         }
@@ -1472,6 +1874,10 @@ async fn bounded_artifact_chunk_context_fts_hits(
     scope_prefix_filter: Option<&str>,
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    leg: SearchLeg,
 ) -> Vec<Hit> {
     match kengram_storage::search_artifact_chunk_contexts_fts_bounded(
         pool,
@@ -1489,7 +1895,16 @@ async fn bounded_artifact_chunk_context_fts_hits(
                 error = %e,
                 query_canceled = e.is_query_canceled(),
                 timeout_ms = lexical_timeout_ms,
-                "bounded contextual-chunk FTS query failed; continuing with available search legs only",
+                "bounded search leg failed; continuing with available search legs only",
+            );
+            storage_leg_fail_open(
+                &e,
+                leg,
+                lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                1,
             );
             vec![]
         }
@@ -1503,28 +1918,63 @@ async fn bounded_pairwise_artifact_chunk_fts_hits(
     scope_prefix_filter: Option<&str>,
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    leg: SearchLeg,
 ) -> Vec<Hit> {
+    // Aggregate fan-out before recorder so receipt.failed_attempts=N matches the one
+    // structured WARN (smith PR20: one receipt N <-> one counter <-> one WARN N).
     let subqueries = pairwise_subqueries(query);
     if subqueries.is_empty() {
         return Vec::new();
     }
 
     let mut rankings = Vec::new();
+    let mut failed_attempts: u32 = 0;
+    let mut last_err: Option<kengram_storage::StorageError> = None;
     for subquery in &subqueries {
-        let hits = bounded_artifact_chunk_fts_hits(
+        match kengram_storage::search_artifact_chunks_fts_bounded(
             pool,
             subquery,
             scope_filter,
             scope_prefix_filter,
-            PAIRWISE_PER_SUBQUERY_TOP_K,
+            PAIRWISE_PER_SUBQUERY_TOP_K as i64,
             lexical_timeout_ms,
         )
-        .await;
-        if !hits.is_empty() {
-            rankings.push(hits);
+        .await
+        {
+            Ok(hits) if !hits.is_empty() => rankings.push(hits),
+            Ok(_) => {}
+            Err(e) => {
+                failed_attempts = failed_attempts.saturating_add(1);
+                last_err = Some(e);
+            }
         }
     }
 
+    // Record failed subqueries even when other subqueries produced rankings
+    // (mixed success+timeout must retain failed_attempts — smith PR20 F1).
+    if failed_attempts > 0 {
+        if let Some(e) = last_err.as_ref() {
+            tracing::warn!(
+                error = %e,
+                query_canceled = e.is_query_canceled(),
+                timeout_ms = lexical_timeout_ms,
+                failed_attempts,
+                "bounded pairwise fan-out had failed subqueries; continuing with available hits",
+            );
+            storage_leg_fail_open(
+                e,
+                leg,
+                lexical_timeout_ms,
+                counters,
+                degradations,
+                search_seq,
+                failed_attempts.max(1),
+            );
+        }
+    }
     if rankings.is_empty() {
         return Vec::new();
     }
@@ -1875,6 +2325,10 @@ async fn apply_rerank_to_thought_hits(
     hits: &mut Vec<kengram_core::Hit>,
     candidate_pool: usize,
     exact_identifier_boost_enabled: bool,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
+    rerank_timeout_ms: Option<u64>,
 ) -> bool {
     if hits.is_empty() {
         return false;
@@ -1896,6 +2350,18 @@ async fn apply_rerank_to_thought_hits(
                 error = %e,
                 transient = e.is_transient(),
                 "reranker failed; falling back to RRF + recency order",
+            );
+            record_degradation(
+                counters,
+                degradations,
+                SearchDegradation::new(
+                    SearchLeg::Rerank,
+                    reason_from_reranker(&e),
+                    DegradationFallback::RrfRecency,
+                    rerank_timeout_ms,
+                    1,
+                ),
+                search_seq,
             );
             return false;
         }
@@ -2119,8 +2585,12 @@ mod tests {
         EmbedderError, EmbeddingModel, LinkDirection, LinkSource, LinkTarget, RelationKind,
         SparseEmbeddingModel, SparseLexicalVector, SparseWeight, TagKind, Tags,
     };
-    use kengram_embed::{FakeBehavior, FakeEmbedder, FakeReranker};
+    use kengram_embed::{FakeBehavior, FakeEmbedder, FakeReranker, TeiReranker, TeiRerankerConfig};
     use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const TEST_EMBEDDER_MODEL_ID: &str = "qwen3-embedding";
 
@@ -2248,7 +2718,21 @@ mod tests {
             test_hit("plain first candidate"),
             test_hit("KGR999 exact id"),
         ];
-        assert!(apply_rerank_to_thought_hits(&reranker, query, &mut flag_off, 2, false).await);
+        assert!({
+            let mut d = Vec::new();
+            apply_rerank_to_thought_hits(
+                &reranker,
+                query,
+                &mut flag_off,
+                2,
+                false,
+                None,
+                &mut d,
+                0,
+                None,
+            )
+            .await
+        });
         assert_eq!(flag_off[0].thought.content, "plain first candidate");
         assert_eq!(flag_off[1].thought.content, "KGR999 exact id");
 
@@ -2256,7 +2740,21 @@ mod tests {
             test_hit("plain first candidate"),
             test_hit("KGR999 exact id"),
         ];
-        assert!(apply_rerank_to_thought_hits(&reranker, query, &mut flag_on, 2, true).await);
+        assert!({
+            let mut d = Vec::new();
+            apply_rerank_to_thought_hits(
+                &reranker,
+                query,
+                &mut flag_on,
+                2,
+                true,
+                None,
+                &mut d,
+                0,
+                None,
+            )
+            .await
+        });
         assert_eq!(flag_on[0].thought.content, "KGR999 exact id");
         assert_eq!(flag_on[1].thought.content, "plain first candidate");
     }
@@ -2487,10 +2985,16 @@ mod tests {
         let id = cap(&pool, "the tcgplayer integration was painful", "work").await;
 
         let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
-        let resp = search_thoughts(
+        let counters = Arc::new(SearchCounters::new());
+        let resp = search_thoughts_with_runtime(
             &pool,
             &bad,
             None,
+            None,
+            SearchRuntimeOptions {
+                counters: Some(counters.clone()),
+                ..SearchRuntimeOptions::default()
+            },
             SearchRequest {
                 query: "tcgplayer".to_string(),
                 scope: None,
@@ -2510,8 +3014,28 @@ mod tests {
         .unwrap();
 
         assert!(!resp.vector_search_available);
+        assert_eq!(
+            resp.degradations.len(),
+            1,
+            "KENGRAM_DELIVERY_A_RED:V1_query_embedding_receipt"
+        );
+        assert_eq!(resp.degradations[0].leg, SearchLeg::QueryEmbedding);
+        assert_eq!(resp.degradations[0].reason, DegradationReason::Unreachable);
+        assert_eq!(
+            resp.degradations[0].fallback,
+            DegradationFallback::LexicalOnly
+        );
         assert_eq!(resp.results.len(), 1);
         assert_eq!(resp.results[0].thought_id, id);
+        let snap = counters.snapshot(serde_json::json!({}));
+        assert_eq!(snap.requests_total, 1);
+        assert_eq!(snap.degraded_requests_total, 1);
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "query_embedding" && c.reason == "unreachable")
+            .unwrap();
+        assert_eq!(cell.count, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -2610,43 +3134,71 @@ mod tests {
         assert_eq!(hit.chunk_index, Some(0));
     }
 
+    /// V2 — FTS timeout, causally armed.
+    /// 1) ACCESS EXCLUSIVE + production search_fts_bounded proves SQLSTATE 57014.
+    /// 2) Load + short statement_timeout re-arms cancel for the orchestrator so a
+    ///    healthy vector leg can complete (vector has no statement_timeout; FTS does).
     #[sqlx::test(migrations = "../../migrations")]
-    async fn search_thoughts_soft_fails_timed_out_fts_leg(pool: PgPool) {
+    async fn search_thoughts_fts_timeout_causally_armed(pool: PgPool) {
         let embedder = test_embedder();
-        let needle = "needle vector anchor";
+        let needle = "causal fts cancel needle vector anchor";
         let needle_id = cap_and_drain(&pool, &embedder, needle, "global").await;
 
-        for i in 0..512 {
+        // (1) Capability arming against production bounded storage.
+        {
+            let mut blocker = pool.begin().await.unwrap();
+            sqlx::query("LOCK TABLE thoughts IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *blocker)
+                .await
+                .unwrap();
+            let started = std::time::Instant::now();
+            let err = kengram_storage::search_fts_bounded(&pool, needle, None, None, 10, 50)
+                .await
+                .expect_err("locked thoughts must cancel bounded FTS");
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(800),
+                "statement_timeout should cancel the blocked FTS query promptly"
+            );
+            assert!(
+                err.is_query_canceled(),
+                "expected Postgres query-canceled (57014) before swallow, got {err:?}"
+            );
+            blocker.rollback().await.unwrap();
+        }
+
+        // (2) Orchestrator: force FTS cancel via short budget + load; vector remains healthy.
+        for i in 0..256 {
             cap(
                 &pool,
                 &format!(
-                    "bounded fts load filler {i} needle vector anchor {}",
-                    "surface noise ".repeat(350)
+                    "bounded fts load filler {i} causal fts cancel needle vector anchor {}",
+                    "surface noise ".repeat(400)
                 ),
                 "load",
             )
             .await;
         }
 
-        let started = std::time::Instant::now();
-        let lexical_hits =
-            bounded_fts_hits(&pool, needle, None, None, DEFAULT_LEXICAL_TOP_K, 1).await;
+        // Re-arm: production bounded call must still cancel under this load+budget.
+        let err = kengram_storage::search_fts_bounded(&pool, needle, None, None, 50, 1)
+            .await
+            .expect_err("load+1ms must cancel bounded FTS");
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(800),
-            "timed-out FTS leg should return inside its budget"
-        );
-        assert!(
-            lexical_hits.is_empty(),
-            "timed-out FTS leg must soft-fail to an empty leg"
+            err.is_query_canceled(),
+            "load fixture must yield query-canceled before orchestrator credit, got {err:?}"
         );
 
+        let counters = Arc::new(SearchCounters::new());
         let resp = search_thoughts_with_tuning(
             &pool,
             &embedder,
             None,
             None,
             None,
-            SearchRuntimeOptions::default(),
+            SearchRuntimeOptions {
+                counters: Some(counters.clone()),
+                ..SearchRuntimeOptions::default()
+            },
             SearchRequest {
                 query: needle.to_string(),
                 scope: None,
@@ -2669,13 +3221,286 @@ mod tests {
         .unwrap();
 
         assert!(resp.vector_search_available);
+        let fts_deg = resp
+            .degradations
+            .iter()
+            .find(|d| d.leg == SearchLeg::ThoughtFts)
+            .expect("KENGRAM_DELIVERY_A_RED:V2_thought_fts_timeout_receipt");
+        assert_eq!(fts_deg.reason, DegradationReason::Timeout);
+        assert_eq!(fts_deg.fallback, DegradationFallback::AvailableSearchLegs);
+        assert_eq!(fts_deg.timeout_ms, Some(1));
+        assert_eq!(fts_deg.failed_attempts, 1);
         assert!(
-            resp.results.iter().any(|hit| hit.thought_id == needle_id
-                && hit.vector_score.is_some()
-                && hit.lexical_score.is_none()
-                && hit.trigram_score.is_none()),
-            "outer search should still return vector results when FTS times out"
+            resp.results
+                .iter()
+                .any(|hit| hit.thought_id == needle_id && hit.vector_score.is_some()),
+            "vector result must survive FTS cancel"
         );
+
+        let snap = counters.snapshot(serde_json::json!({}));
+        assert_eq!(snap.requests_total, 1);
+        assert_eq!(snap.degraded_requests_total, 1);
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "thought_fts" && c.reason == "timeout")
+            .expect("thought_fts/timeout cell");
+        assert_eq!(cell.count, 1);
+        let qe = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "query_embedding" && c.reason == "timeout")
+            .unwrap();
+        assert_eq!(qe.count, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_thoughts_soft_fails_timed_out_fts_leg(pool: PgPool) {
+        let embedder = test_embedder();
+        let needle = "legacy soft-fail alias needle";
+        let _needle_id = cap_and_drain(&pool, &embedder, needle, "global").await;
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE thoughts IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let err = kengram_storage::search_fts_bounded(&pool, needle, None, None, 10, 50)
+            .await
+            .unwrap_err();
+        assert!(
+            err.is_query_canceled(),
+            "causal arm required before soft-fail credit, got {err:?}"
+        );
+
+        let mut deg = Vec::new();
+        let counters = Arc::new(SearchCounters::new());
+        let lexical_hits = bounded_fts_hits(
+            &pool,
+            needle,
+            None,
+            None,
+            DEFAULT_LEXICAL_TOP_K,
+            50,
+            Some(&counters),
+            &mut deg,
+            1,
+            SearchLeg::ThoughtFts,
+        )
+        .await;
+        blocker.rollback().await.unwrap();
+
+        assert!(lexical_hits.is_empty());
+        assert_eq!(deg.len(), 1);
+        assert_eq!(deg[0].leg, SearchLeg::ThoughtFts);
+        assert_eq!(deg[0].reason, DegradationReason::Timeout);
+        let snap = counters.snapshot(serde_json::json!({}));
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "thought_fts" && c.reason == "timeout")
+            .unwrap();
+        assert_eq!(cell.count, 1);
+    }
+
+    /// V3 — reranker timeout through production TeiReranker + WireMock delay.
+
+    /// V2 fan-out: pairwise subqueries accumulate failed_attempts on one logical receipt.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_pairwise_fts_timeout_failed_attempts_aggregated(pool: PgPool) {
+        ensure_test_chunk_schema(&pool).await;
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE artifact_chunks IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let mut deg = Vec::new();
+        let counters = Arc::new(SearchCounters::new());
+        let hits = bounded_pairwise_artifact_chunk_fts_hits(
+            &pool,
+            "alpha beta gamma",
+            None,
+            None,
+            DEFAULT_LEXICAL_TOP_K,
+            50,
+            Some(&counters),
+            &mut deg,
+            1,
+            SearchLeg::PairwiseChunkFts,
+        )
+        .await;
+        blocker.rollback().await.unwrap();
+
+        assert!(hits.is_empty());
+        assert_eq!(
+            deg.len(),
+            1,
+            "KENGRAM_DELIVERY_A_RED:V2_pairwise_one_logical_receipt"
+        );
+        assert_eq!(deg[0].leg, SearchLeg::PairwiseChunkFts);
+        assert_eq!(deg[0].reason, DegradationReason::Timeout);
+        assert_eq!(
+            deg[0].failed_attempts, 2,
+            "KENGRAM_DELIVERY_A_RED:V2_pairwise_failed_attempts"
+        );
+        let snap = counters.snapshot(serde_json::json!({}));
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "pairwise_chunk_fts" && c.reason == "timeout")
+            .unwrap();
+        assert_eq!(cell.count, 1);
+    }
+
+    /// F1: non-default unequal lexical budgets route to the exact leg receipt.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn lexical_timeouts_unequal_route_and_receipt_timeout_ms(pool: PgPool) {
+        // Bad embedder skips vector path so FTS is the leg under lock.
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let needle = "unequal timeout route needle";
+        let _id = cap(&pool, needle, "global").await;
+
+        let counters = Arc::new(SearchCounters::new());
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE thoughts IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let resp = search_thoughts_with_tuning(
+            &pool,
+            &bad,
+            None,
+            None,
+            None,
+            SearchRuntimeOptions {
+                counters: Some(counters.clone()),
+                thought_fts_timeout_ms: 50,
+                chunk_fts_timeout_ms: 400,
+                contextual_chunk_fts_timeout_ms: 500,
+                pairwise_chunk_fts_timeout_ms: 600,
+                domain_scope_timeout_ms: 700,
+                tag_facet_timeout_ms: 1234,
+                expansion_fts_timeout_ms: 800,
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: needle.to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
+                include_profile: false,
+            },
+            DEFAULT_LEXICAL_TOP_K,
+            DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            DEFAULT_RERANK_CANDIDATE_POOL,
+        )
+        .await
+        .unwrap();
+        blocker.rollback().await.unwrap();
+
+        let fts = resp
+            .degradations
+            .iter()
+            .find(|d| d.leg == SearchLeg::ThoughtFts)
+            .expect("KENGRAM_DELIVERY_A_RED:F1_unequal_thought_fts_routed");
+        assert_eq!(
+            fts.timeout_ms,
+            Some(50),
+            "KENGRAM_DELIVERY_A_RED:F1_receipt_timeout_matches_thought_fts_budget"
+        );
+        assert_ne!(fts.timeout_ms, Some(1234));
+        assert_ne!(fts.timeout_ms, Some(DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_thoughts_rerank_timeout_via_tei_wiremock(pool: PgPool) {
+        let embedder = test_embedder();
+        let _a = cap_and_drain(&pool, &embedder, "alpha candidate about widgets", "global").await;
+        let _b = cap_and_drain(&pool, &embedder, "beta candidate about gadgets", "global").await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rerank"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+
+        let tei = TeiReranker::new(TeiRerankerConfig {
+            endpoint: server.uri(),
+            model_id: "BAAI/bge-reranker-v2-m3".into(),
+            timeout: Duration::from_secs(1),
+        })
+        .unwrap();
+
+        let counters = Arc::new(SearchCounters::new());
+        let resp = search_thoughts_with_tuning(
+            &pool,
+            &embedder,
+            None,
+            Some(&tei as &dyn kengram_embed::Reranker),
+            None,
+            SearchRuntimeOptions {
+                counters: Some(counters.clone()),
+                rerank_timeout_ms: Some(1000),
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: "widgets gadgets".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(true),
+                candidate_pool: Some(10),
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
+                include_profile: false,
+            },
+            DEFAULT_LEXICAL_TOP_K,
+            DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            DEFAULT_RERANK_CANDIDATE_POOL,
+        )
+        .await
+        .unwrap();
+
+        assert!(!resp.rerank_used);
+        assert_eq!(
+            resp.degradations.len(),
+            1,
+            "KENGRAM_DELIVERY_A_RED:V3_rerank_timeout_receipt"
+        );
+        assert_eq!(resp.degradations[0].leg, SearchLeg::Rerank);
+        assert_eq!(resp.degradations[0].reason, DegradationReason::Timeout);
+        assert_eq!(
+            resp.degradations[0].fallback,
+            DegradationFallback::RrfRecency
+        );
+        assert_eq!(resp.degradations[0].timeout_ms, Some(1000));
+        assert!(
+            !resp.results.is_empty(),
+            "RRF order must survive rerank timeout"
+        );
+
+        let snap = counters.snapshot(serde_json::json!({}));
+        assert_eq!(snap.requests_total, 1);
+        assert_eq!(snap.degraded_requests_total, 1);
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "rerank" && c.reason == "timeout")
+            .unwrap();
+        assert_eq!(cell.count, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -3374,6 +4199,7 @@ mod tests {
         let expander = StaticQueryExpander {
             output: Err(QueryExpansionError::Timeout { seconds: 1 }),
         };
+        let counters = Arc::new(SearchCounters::new());
         let resp = search_thoughts_with_runtime(
             &pool,
             &embedder,
@@ -3382,6 +4208,7 @@ mod tests {
             SearchRuntimeOptions {
                 query_expansion_enabled: true,
                 hyde_enabled: true,
+                counters: Some(counters.clone()),
                 ..SearchRuntimeOptions::default()
             },
             SearchRequest {
@@ -3412,6 +4239,25 @@ mod tests {
             Some("timeout")
         );
         assert_eq!(profile.query_expansion_variant_count, 0);
+        assert_eq!(
+            resp.degradations.len(),
+            1,
+            "KENGRAM_DELIVERY_A_RED:F2_query_expansion_receipt"
+        );
+        assert_eq!(resp.degradations[0].leg, SearchLeg::QueryExpansion);
+        assert_eq!(resp.degradations[0].reason, DegradationReason::Timeout);
+        assert_eq!(
+            resp.degradations[0].fallback,
+            DegradationFallback::OriginalQuery
+        );
+        let snap = counters.snapshot(serde_json::json!({}));
+        assert_eq!(snap.degraded_requests_total, 1);
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "query_expansion" && c.reason == "timeout")
+            .unwrap();
+        assert_eq!(cell.count, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -3429,6 +4275,7 @@ mod tests {
                 facets: Default::default(),
             }),
         };
+        let counters = Arc::new(SearchCounters::new());
         let resp = search_thoughts_with_runtime(
             &pool,
             &bad,
@@ -3439,6 +4286,7 @@ mod tests {
                 hyde_enabled: true,
                 query_expansion_max_variants: 4,
                 query_expansion_max_hyde_chars: 600,
+                counters: Some(counters.clone()),
                 ..SearchRuntimeOptions::default()
             },
             SearchRequest {
@@ -3468,6 +4316,26 @@ mod tests {
         assert_eq!(profile.query_expansion_variant_count, 1);
         assert!(profile.query_expansion_hyde_used);
         assert!(profile.query_expansion_thought_fts_hits >= 2);
+        // Bad embedder fails primary query_embedding AND expansion_embedding.
+        assert!(
+            resp.degradations
+                .iter()
+                .any(|d| d.leg == SearchLeg::ExpansionEmbedding),
+            "KENGRAM_DELIVERY_A_RED:F2_expansion_embedding_receipt"
+        );
+        assert!(
+            resp.degradations
+                .iter()
+                .any(|d| d.leg == SearchLeg::QueryEmbedding),
+            "primary query embed also degrades"
+        );
+        let snap = counters.snapshot(serde_json::json!({}));
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "expansion_embedding" && c.reason == "unreachable")
+            .unwrap();
+        assert_eq!(cell.count, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

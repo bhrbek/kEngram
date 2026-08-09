@@ -120,9 +120,61 @@ pub struct SearchConfig {
     pub query_expansion_temperature: f32,
     pub query_expansion_prompt_version: String,
     pub query_expansion_max_hyde_chars: usize,
+    // Delivery A: explicit lexical statement timeouts (ms). Defaults preserve
+    // DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS = 300. Figment env examples:
+    // KENGRAM_SEARCH__THOUGHT_FTS_TIMEOUT_MS, KENGRAM_SEARCH__CHUNK_FTS_TIMEOUT_MS,
+    // KENGRAM_SEARCH__CONTEXTUAL_CHUNK_FTS_TIMEOUT_MS, KENGRAM_SEARCH__PAIRWISE_CHUNK_FTS_TIMEOUT_MS,
+    // KENGRAM_SEARCH__DOMAIN_SCOPE_TIMEOUT_MS, KENGRAM_SEARCH__TAG_FACET_TIMEOUT_MS,
+    // KENGRAM_SEARCH__EXPANSION_FTS_TIMEOUT_MS.
+    pub thought_fts_timeout_ms: u64,
+    pub chunk_fts_timeout_ms: u64,
+    pub contextual_chunk_fts_timeout_ms: u64,
+    pub pairwise_chunk_fts_timeout_ms: u64,
+    pub domain_scope_timeout_ms: u64,
+    pub tag_facet_timeout_ms: u64,
+    pub expansion_fts_timeout_ms: u64,
 }
 
 impl SearchConfig {
+    /// Delivery A: each lexical timeout must be 1..=60_000.
+    pub fn validate_lexical_timeouts(&self) -> Result<(), String> {
+        for (name, v) in [
+            ("thought_fts_timeout_ms", self.thought_fts_timeout_ms),
+            ("chunk_fts_timeout_ms", self.chunk_fts_timeout_ms),
+            (
+                "contextual_chunk_fts_timeout_ms",
+                self.contextual_chunk_fts_timeout_ms,
+            ),
+            (
+                "pairwise_chunk_fts_timeout_ms",
+                self.pairwise_chunk_fts_timeout_ms,
+            ),
+            ("domain_scope_timeout_ms", self.domain_scope_timeout_ms),
+            ("tag_facet_timeout_ms", self.tag_facet_timeout_ms),
+            ("expansion_fts_timeout_ms", self.expansion_fts_timeout_ms),
+        ] {
+            if !(1..=60_000).contains(&v) {
+                return Err(format!(
+                    "search.{name} must be 1..=60000 (got {v}); zero is not unlimited"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn effective_timeouts_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "thought_fts_timeout_ms": self.thought_fts_timeout_ms,
+            "chunk_fts_timeout_ms": self.chunk_fts_timeout_ms,
+            "contextual_chunk_fts_timeout_ms": self.contextual_chunk_fts_timeout_ms,
+            "pairwise_chunk_fts_timeout_ms": self.pairwise_chunk_fts_timeout_ms,
+            "domain_scope_timeout_ms": self.domain_scope_timeout_ms,
+            "tag_facet_timeout_ms": self.tag_facet_timeout_ms,
+            "expansion_fts_timeout_ms": self.expansion_fts_timeout_ms,
+            "query_expansion_timeout_seconds": self.query_expansion_timeout_seconds,
+        })
+    }
+
     pub fn chunk_serving_effective(&self) -> bool {
         self.full_pipeline_enabled && self.chunk_serving_enabled
     }
@@ -218,6 +270,13 @@ impl Default for SearchConfig {
             query_expansion_temperature: 0.1,
             query_expansion_prompt_version: DEFAULT_QUERY_EXPANSION_PROMPT_VERSION.to_string(),
             query_expansion_max_hyde_chars: DEFAULT_QUERY_EXPANSION_MAX_HYDE_CHARS,
+            thought_fts_timeout_ms: 300,
+            chunk_fts_timeout_ms: 300,
+            contextual_chunk_fts_timeout_ms: 300,
+            pairwise_chunk_fts_timeout_ms: 300,
+            domain_scope_timeout_ms: 300,
+            tag_facet_timeout_ms: 300,
+            expansion_fts_timeout_ms: 300,
         }
     }
 }
@@ -1126,5 +1185,32 @@ mod tests {
             .unwrap();
         assert_eq!(c.tagger.concurrency, 3);
         assert_eq!(c.tagger.batch_size, Some(8));
+    }
+    #[test]
+    fn effective_timeouts_json_includes_all_seven_lexical_and_env_docs() {
+        let mut c = Config::default();
+        c.search.thought_fts_timeout_ms = 111;
+        c.search.chunk_fts_timeout_ms = 222;
+        c.search.contextual_chunk_fts_timeout_ms = 333;
+        c.search.pairwise_chunk_fts_timeout_ms = 444;
+        c.search.domain_scope_timeout_ms = 555;
+        c.search.tag_facet_timeout_ms = 1234;
+        c.search.expansion_fts_timeout_ms = 666;
+        let v = c.search.effective_timeouts_json();
+        assert_eq!(v["thought_fts_timeout_ms"], 111);
+        assert_eq!(v["chunk_fts_timeout_ms"], 222);
+        assert_eq!(v["contextual_chunk_fts_timeout_ms"], 333);
+        assert_eq!(v["pairwise_chunk_fts_timeout_ms"], 444);
+        assert_eq!(v["domain_scope_timeout_ms"], 555);
+        assert_eq!(v["tag_facet_timeout_ms"], 1234);
+        assert_eq!(v["expansion_fts_timeout_ms"], 666);
+        let src = include_str!("config.rs");
+        for env in [
+            "KENGRAM_SEARCH__THOUGHT_FTS_TIMEOUT_MS",
+            "KENGRAM_SEARCH__TAG_FACET_TIMEOUT_MS",
+            "KENGRAM_SEARCH__EXPANSION_FTS_TIMEOUT_MS",
+        ] {
+            assert!(src.contains(env), "missing env doc {env}");
+        }
     }
 }
