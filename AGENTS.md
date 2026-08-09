@@ -159,3 +159,19 @@ No marker, any skip/count mismatch, or nonzero exit is failure.
     Judged gate is this registered supersession E2E only (A8 scoped: unprovisioned full kengram-mcp --lib 42501 producer_principal_unmapped is diagnostic, not pass/fail). B4: case_10b requires exact SQLSTATE P0001 and exact message supersession_old_thought_unavailable. B5: zero-receipt down removes supersession_receipt_json_key_count(jsonb) with pre-proven residue.
   Terminal marker: `PASS source-event-supersession selected=<n> executed=<n> failed=0 skipped=0`
   (exact selected/executed equality; zero failed/ignored; cargo must have run).
+
+## Search-leg degradation receipts (Delivery A)
+
+Exact focused command (non-production DB):
+
+```bash
+export SQLX_OFFLINE=true
+export DATABASE_URL="postgres://kengram:kengram@localhost:5432/kengram"
+cargo test -p kengram-mcp --lib degradation:: -- --test-threads=1
+cargo test -p kengram-mcp --lib search::tests::search_thoughts_degrades_when_embedder_fails -- --exact --test-threads=1
+cargo test -p kengram-mcp --lib search::tests::search_thoughts_soft_fails_timed_out_fts_leg -- --exact --test-threads=1
+cargo test -p kengram-cli --bin kengram health:: -- --test-threads=1
+```
+
+Success: each selected command ends with `0 failed` and a positive `passed` count. Health must expose the full fixed leg×reason matrix in enum order.
+

@@ -19,6 +19,7 @@ pub struct OpenAICompatibleEmbedder {
     model: EmbeddingModel,
     api_key: Option<String>,
     client: Client,
+    timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +62,7 @@ impl OpenAICompatibleEmbedder {
             model: config.model,
             api_key: config.api_key,
             client,
+            timeout_seconds: config.timeout.as_secs().max(1),
         })
     }
 }
@@ -103,7 +105,10 @@ impl Embedder for OpenAICompatibleEmbedder {
             req = req.bearer_auth(key);
         }
 
-        let resp = req.send().await.map_err(map_send_error)?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| map_send_error(e, self.timeout_seconds))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -141,9 +146,11 @@ impl Embedder for OpenAICompatibleEmbedder {
     }
 }
 
-fn map_send_error(e: reqwest::Error) -> EmbedderError {
+fn map_send_error(e: reqwest::Error, timeout_seconds: u64) -> EmbedderError {
     if e.is_timeout() {
-        EmbedderError::Timeout { seconds: 5 }
+        EmbedderError::Timeout {
+            seconds: timeout_seconds,
+        }
     } else if e.is_connect() {
         EmbedderError::Unreachable(e.to_string())
     } else if let Some(status) = e.status() {

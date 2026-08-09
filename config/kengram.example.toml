@@ -74,3 +74,14 @@ scope_vocab_size = 50
 # endpoint = "http://localhost:8082"
 # api_key = ""                    # optional bearer; sidecars on a private network usually omit
 # timeout_seconds = 60
+
+# Delivery A — lexical statement timeouts (ms). Defaults preserve prior 300ms budget.
+# Env: KENGRAM_SEARCH__THOUGHT_FTS_TIMEOUT_MS etc.
+# [search]
+# thought_fts_timeout_ms = 300
+# chunk_fts_timeout_ms = 300
+# contextual_chunk_fts_timeout_ms = 300
+# pairwise_chunk_fts_timeout_ms = 300
+# domain_scope_timeout_ms = 300
+# tag_facet_timeout_ms = 300
+# expansion_fts_timeout_ms = 300

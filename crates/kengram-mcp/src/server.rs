@@ -341,6 +341,8 @@ pub struct GetRelatedThoughtsArgs {
 
 #[derive(Clone)]
 pub struct KengramServer {
+    /// Delivery-A process-local search degradation counters.
+    pub search_counters: std::sync::Arc<crate::degradation::SearchCounters>,
     pool: PgPool,
     embedder: Arc<dyn Embedder>,
     sparse_embedder: Option<Arc<dyn SparseEmbedder>>,
@@ -450,7 +452,16 @@ impl KengramServer {
                 && query_expansion_runtime.contextual_chunk_fts_enabled,
             ..query_expansion_runtime
         };
+        let search_counters = query_expansion_runtime
+            .counters
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(crate::degradation::SearchCounters::new()));
+        let query_expansion_runtime = SearchRuntimeOptions {
+            counters: Some(search_counters.clone()),
+            ..query_expansion_runtime
+        };
         Self {
+            search_counters,
             pool,
             embedder,
             sparse_embedder,
@@ -1323,6 +1334,7 @@ fn search_response_json(
         "results": results,
         "vector_search_available": resp.vector_search_available,
         "rerank_used": resp.rerank_used,
+        "degradations": resp.degradations,
     });
     if let Some(profile) = resp.profile.as_ref() {
         body["profile"] = serde_json::to_value(profile).unwrap_or(serde_json::Value::Null);
@@ -1712,6 +1724,7 @@ mod tests {
             results: vec![search_json_hit()],
             vector_search_available: true,
             rerank_used: false,
+            degradations: vec![],
             profile: None,
         }
     }
