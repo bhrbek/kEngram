@@ -1,0 +1,29 @@
+$ cargo test -p kengram-mcp --lib degradation::tests::record_increments_exact_cell -- --exact --test-threads=1 --nocapture
+exit=101
+
+--- stdout ---
+
+running 1 test
+test degradation::tests::record_increments_exact_cell ... FAILED
+
+failures:
+
+failures:
+    degradation::tests::record_increments_exact_cell
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 233 filtered out; finished in 0.00s
+
+
+
+--- stderr ---
+   Compiling kengram-mcp v0.2.0 (/Volumes/dojodevdrive1/worktrees/kengram-pr20-spike-20260809/crates/kengram-mcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.40s
+     Running unittests src/lib.rs (target/debug/deps/kengram_mcp-e9571d5513c81bd6)
+
+thread 'degradation::tests::record_increments_exact_cell' (41241354) panicked at crates/kengram-mcp/src/degradation.rs:404:9:
+assertion `left == right` failed: KENGRAM_DELIVERY_A_RED:M6_counter_index
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p kengram-mcp --lib`
+

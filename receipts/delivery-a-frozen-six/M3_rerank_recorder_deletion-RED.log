@@ -1,0 +1,29 @@
+$ cargo test -p kengram-mcp --lib search::tests::search_thoughts_rerank_timeout_via_tei_wiremock -- --exact --test-threads=1 --nocapture
+exit=101
+
+--- stdout ---
+
+running 1 test
+test search::tests::search_thoughts_rerank_timeout_via_tei_wiremock ... FAILED
+
+failures:
+
+failures:
+    search::tests::search_thoughts_rerank_timeout_via_tei_wiremock
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 233 filtered out; finished in 1.23s
+
+
+
+--- stderr ---
+   Compiling kengram-mcp v0.2.0 (/Volumes/dojodevdrive1/worktrees/kengram-pr20-spike-20260809/crates/kengram-mcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.70s
+     Running unittests src/lib.rs (target/debug/deps/kengram_mcp-e9571d5513c81bd6)
+
+thread 'search::tests::search_thoughts_rerank_timeout_via_tei_wiremock' (41236868) panicked at crates/kengram-mcp/src/search.rs:3483:9:
+assertion `left == right` failed
+  left: ThoughtFts
+ right: Rerank
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p kengram-mcp --lib`
+

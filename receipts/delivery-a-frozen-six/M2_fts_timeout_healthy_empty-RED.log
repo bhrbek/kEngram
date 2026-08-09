@@ -1,0 +1,27 @@
+$ cargo test -p kengram-mcp --lib search::tests::search_thoughts_fts_timeout_causally_armed -- --exact --test-threads=1 --nocapture
+exit=101
+
+--- stdout ---
+
+running 1 test
+test search::tests::search_thoughts_fts_timeout_causally_armed ... FAILED
+
+failures:
+
+failures:
+    search::tests::search_thoughts_fts_timeout_causally_armed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 233 filtered out; finished in 0.76s
+
+
+
+--- stderr ---
+   Compiling kengram-mcp v0.2.0 (/Volumes/dojodevdrive1/worktrees/kengram-pr20-spike-20260809/crates/kengram-mcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.11s
+     Running unittests src/lib.rs (target/debug/deps/kengram_mcp-e9571d5513c81bd6)
+
+thread 'search::tests::search_thoughts_fts_timeout_causally_armed' (41235066) panicked at crates/kengram-mcp/src/search.rs:3231:14:
+KENGRAM_DELIVERY_A_RED:V2_thought_fts_timeout_receipt
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p kengram-mcp --lib`
+

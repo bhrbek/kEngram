@@ -1,0 +1,17 @@
+$ cargo test -p kengram-cli --bin kengram health::tests::health_route_via_axum_router -- --exact --test-threads=1 --nocapture
+exit=0
+
+--- stdout ---
+
+running 1 test
+test health::tests::health_route_via_axum_router ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 96 filtered out; finished in 0.01s
+
+
+
+--- stderr ---
+   Compiling kengram-cli v0.2.0 (/Volumes/dojodevdrive1/worktrees/kengram-pr20-spike-20260809/crates/kengram-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.36s
+     Running unittests src/main.rs (target/debug/deps/kengram-3c77dd11706b3ffa)
+
