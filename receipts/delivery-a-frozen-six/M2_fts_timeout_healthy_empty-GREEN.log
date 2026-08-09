@@ -6,12 +6,12 @@ exit=0
 running 1 test
 test search::tests::search_thoughts_fts_timeout_causally_armed ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 233 filtered out; finished in 0.80s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 233 filtered out; finished in 0.83s
 
 
 
 --- stderr ---
-   Compiling kengram-mcp v0.2.0 (/Volumes/dojodevdrive1/worktrees/kengram-pr20-spike-20260809/crates/kengram-mcp)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.14s
+   Compiling kengram-mcp v0.2.0 (/Volumes/devdrive1/worktrees/kengram-diesel-pr20-ceremony-20260809/crates/kengram-mcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.12s
      Running unittests src/lib.rs (target/debug/deps/kengram_mcp-e9571d5513c81bd6)
 
