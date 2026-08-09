@@ -61,6 +61,10 @@ pub struct FakeTagger {
     /// shared reference through the drainer loop and tests need to inspect
     /// post-run state.
     last_call: Arc<Mutex<Option<RecordedTag>>>,
+    /// Full call log (concurrent drains may interleave).
+    all_calls: Arc<Mutex<Vec<RecordedTag>>>,
+    /// Artificial delay before returning (tests for concurrency throughput).
+    delay: std::time::Duration,
 }
 
 impl FakeTagger {
@@ -73,6 +77,8 @@ impl FakeTagger {
             behavior: FakeBehavior::Deterministic,
             output: FakeTaggerOutput::Empty,
             last_call: Arc::new(Mutex::new(None)),
+            all_calls: Arc::new(Mutex::new(Vec::new())),
+            delay: std::time::Duration::ZERO,
         }
     }
 
@@ -128,6 +134,21 @@ impl FakeTagger {
             .expect("last_call mutex poisoned")
             .clone()
     }
+
+    /// All `tag()` calls in order of completion (not start).
+    pub fn all_calls(&self) -> Vec<RecordedTag> {
+        self.all_calls
+            .lock()
+            .expect("all_calls mutex poisoned")
+            .clone()
+    }
+
+    /// Sleep this long inside `tag()` before returning (concurrency tests).
+    pub fn with_delay(mut self, delay: std::time::Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
 }
 
 impl Default for FakeTagger {
@@ -151,10 +172,25 @@ impl Tagger for FakeTagger {
         thought_content: &str,
         vocab: Option<&ScopeVocab>,
     ) -> Result<TagOutput, TaggerError> {
-        *self.last_call.lock().expect("last_call mutex poisoned") = Some(RecordedTag {
+        let recorded = RecordedTag {
             content: thought_content.to_string(),
             vocab: vocab.cloned(),
-        });
+        };
+        *self.last_call.lock().expect("last_call mutex poisoned") = Some(recorded.clone());
+        self.all_calls
+            .lock()
+            .expect("all_calls mutex poisoned")
+            .push(recorded);
+        if !self.delay.is_zero() {
+            // std sleep: FakeTagger is test-only; avoids requiring tokio time feature here.
+            tokio::time::sleep(self.delay).await;
+        }
+        // Permanent poison needle for concurrent-batch isolation tests.
+        if thought_content.contains("POISON__TAG_JOB") {
+            return Err(TaggerError::Misconfigured(
+                "fake poison thought".into(),
+            ));
+        }
         match self.behavior {
             FakeBehavior::Timeout => Err(TaggerError::Timeout { seconds: 5 }),
             FakeBehavior::Unreachable => Err(TaggerError::Unreachable(

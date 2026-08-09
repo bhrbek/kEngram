@@ -18,7 +18,11 @@ use kengram_core::{
     Embedder, EmbedderError, Embedding, EmbeddingError, ExtractedRelation, Tagger, ThoughtId,
 };
 use sha2::{Digest, Sha256};
+use futures::stream::{self, StreamExt};
 use sqlx::PgPool;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DrainReport {
@@ -272,12 +276,16 @@ pub async fn drain_pending_tags(
     tagger: &dyn Tagger,
     batch_size: i64,
     scope_vocab_limit: Option<i64>,
+    concurrency: usize,
 ) -> Result<DrainTagsReport, DrainError> {
     let jobs = kengram_storage::fetch_pending_tag_jobs(pool, batch_size).await?;
     let mut report = DrainTagsReport {
         processed: jobs.len(),
         ..Default::default()
     };
+    if jobs.is_empty() {
+        return Ok(report);
+    }
 
     // Corpus scope set, fetched once per batch (low cardinality, cheap) so the
     // deterministic scope-identifier filter runs per job without a per-job
@@ -294,8 +302,36 @@ pub async fn drain_pending_tags(
         }
     };
 
-    for job in jobs {
-        match process_tag_job(pool, tagger, scope_vocab_limit, &job, &known_scopes).await {
+    // Bounded concurrent tagger.tag within the batch. concurrency=1 preserves
+    // the legacy sequential for-loop semantics. Clamped to ≥1.
+    let concurrency = concurrency.max(1);
+    // Per-scope vocab cache for this batch — same scope should not re-query.
+    let vocab_cache: Arc<Mutex<HashMap<String, Option<kengram_core::ScopeVocab>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let known_scopes = Arc::new(known_scopes);
+
+    let outcomes: Vec<TagJobOutcome> = stream::iter(jobs)
+        .map(|job| {
+            let known_scopes = Arc::clone(&known_scopes);
+            let vocab_cache = Arc::clone(&vocab_cache);
+            async move {
+                process_tag_job(
+                    pool,
+                    tagger,
+                    scope_vocab_limit,
+                    &job,
+                    known_scopes.as_slice(),
+                    vocab_cache,
+                )
+                .await
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+
+    for outcome in outcomes {
+        match outcome {
             TagJobOutcome::Completed => report.completed += 1,
             TagJobOutcome::Transient => report.failed_transient += 1,
             TagJobOutcome::Permanent => report.failed_permanent += 1,
@@ -317,6 +353,7 @@ async fn process_tag_job(
     scope_vocab_limit: Option<i64>,
     job: &kengram_storage::PendingTagJob,
     known_scopes: &[String],
+    vocab_cache: Arc<Mutex<HashMap<String, Option<kengram_core::ScopeVocab>>>>,
 ) -> TagJobOutcome {
     // Fetch the thought's content.
     let thought = match kengram_storage::fetch_thought(pool, job.thought_id).await {
@@ -348,26 +385,47 @@ async fn process_tag_job(
     };
 
     // Optionally fetch controlled-vocabulary hints for the thought's scope.
-    // A storage failure here is transient — leaves the job queued for retry.
+    // Cached per scope within this drain batch so concurrent jobs sharing a
+    // scope do not re-query. A storage failure is transient.
     let vocab = match scope_vocab_limit {
         Some(limit) if limit > 0 => {
-            match kengram_storage::fetch_scope_vocab(pool, thought.scope.as_str(), limit).await {
-                Ok(v) if v.is_empty() => None,
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::warn!(
-                        thought_id = %job.thought_id,
-                        scope = %thought.scope.as_str(),
-                        error = %e,
-                        "tag-drain: scope vocab fetch failed; leaving job for retry",
-                    );
-                    let _ = kengram_storage::increment_tag_job_attempts(
-                        pool,
-                        job.thought_id,
-                        job.tag_job_generation_id,
-                    )
-                    .await;
-                    return TagJobOutcome::Transient;
+            let scope_key = thought.scope.as_str().to_string();
+            {
+                let guard = vocab_cache.lock().await;
+                if let Some(cached) = guard.get(&scope_key) {
+                    cached.clone()
+                } else {
+                    drop(guard);
+                    match kengram_storage::fetch_scope_vocab(pool, thought.scope.as_str(), limit)
+                        .await
+                    {
+                        Ok(v) if v.is_empty() => {
+                            vocab_cache.lock().await.insert(scope_key, None);
+                            None
+                        }
+                        Ok(v) => {
+                            vocab_cache
+                                .lock()
+                                .await
+                                .insert(scope_key, Some(v.clone()));
+                            Some(v)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                thought_id = %job.thought_id,
+                                scope = %thought.scope.as_str(),
+                                error = %e,
+                                "tag-drain: scope vocab fetch failed; leaving job for retry",
+                            );
+                            let _ = kengram_storage::increment_tag_job_attempts(
+                                pool,
+                                job.thought_id,
+                                job.tag_job_generation_id,
+                            )
+                            .await;
+                            return TagJobOutcome::Transient;
+                        }
+                    }
                 }
             }
         }
@@ -754,7 +812,7 @@ mod tests {
         };
         let tagger = FakeTagger::with_canned(tags.clone());
 
-        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
         assert_eq!(report.processed, 1);
         assert_eq!(report.completed, 1);
         assert_eq!(report.failed_transient, 0);
@@ -783,7 +841,7 @@ mod tests {
         let id = capture_and_enqueue_tag(&pool, "transient-fail content").await;
 
         let tagger = FakeTagger::always_failing(TaggerFakeBehavior::Timeout);
-        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
         assert_eq!(report.processed, 1);
         assert_eq!(report.completed, 0);
         assert_eq!(report.failed_transient, 1);
@@ -822,7 +880,7 @@ mod tests {
         }
 
         let tagger = FakeTagger::always_failing(TaggerFakeBehavior::Timeout);
-        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
         assert_eq!(report.processed, 1);
         assert_eq!(report.failed_permanent, 1);
 
@@ -838,7 +896,7 @@ mod tests {
         let _id = capture_and_enqueue_tag(&pool, "misconfigured tagger").await;
 
         let tagger = FakeTagger::always_failing(TaggerFakeBehavior::Misconfigured);
-        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
         assert_eq!(report.processed, 1);
         assert_eq!(report.failed_permanent, 1);
 
@@ -852,7 +910,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn drain_tags_empty_queue_is_a_noop(pool: PgPool) {
         let tagger = FakeTagger::new();
-        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
         assert_eq!(report.processed, 0);
         assert_eq!(report.completed, 0);
     }
@@ -891,7 +949,7 @@ mod tests {
         let _id = capture_and_enqueue_tag(&pool, "fresh thought needing vocab").await;
 
         let tagger = FakeTagger::new();
-        let report = drain_pending_tags(&pool, &tagger, 10, Some(50))
+        let report = drain_pending_tags(&pool, &tagger, 10, Some(50), 1)
             .await
             .unwrap();
         assert_eq!(report.completed, 1);
@@ -933,7 +991,7 @@ mod tests {
         let _id = capture_and_enqueue_tag(&pool, "fresh thought").await;
 
         let tagger = FakeTagger::new();
-        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
         assert_eq!(report.completed, 1);
 
         let rec = tagger.last_call().expect("tag call recorded");
@@ -948,7 +1006,7 @@ mod tests {
         let _id = capture_and_enqueue_tag(&pool, "first-ever thought in this scope").await;
 
         let tagger = FakeTagger::new();
-        let report = drain_pending_tags(&pool, &tagger, 10, Some(50))
+        let report = drain_pending_tags(&pool, &tagger, 10, Some(50), 1)
             .await
             .unwrap();
         assert_eq!(report.completed, 1);
@@ -988,7 +1046,7 @@ mod tests {
             },
         ]);
         let tagger = FakeTagger::with_canned_output(canned);
-        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
         assert_eq!(report.completed, 1);
 
         let related = kengram_storage::fetch_related_thoughts(
@@ -1021,7 +1079,7 @@ mod tests {
             note: None,
         }]);
         let tagger = FakeTagger::with_canned_output(first);
-        drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+        drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
 
         let after_first = kengram_storage::fetch_related_thoughts(
             &pool,
@@ -1048,7 +1106,7 @@ mod tests {
             note: None,
         }]);
         let tagger = FakeTagger::with_canned_output(second);
-        drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+        drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
 
         let after_second = kengram_storage::fetch_related_thoughts(
             &pool,
@@ -1102,7 +1160,7 @@ mod tests {
             note: None,
         }]);
         let tagger = FakeTagger::with_canned_output(canned);
-        drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+        drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
 
         let related = kengram_storage::fetch_related_thoughts(
             &pool,
@@ -1137,7 +1195,7 @@ mod tests {
             },
         ]);
         let tagger = FakeTagger::with_canned_output(canned);
-        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1).await.unwrap();
         assert_eq!(report.completed, 0);
         assert_eq!(report.failed_transient, 1);
         assert_eq!(report.failed_permanent, 0);
@@ -1159,5 +1217,151 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].thought_id, id);
         assert_eq!(jobs[0].attempts, 1);
+    }
+
+    /// Concurrent tagging must not cross-contaminate: each thought gets tags
+    /// derived only from its own content (order-independent completion).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_tags_concurrent_no_cross_thought_bleed(pool: PgPool) {
+        use kengram_core::{TagOutput, Tags};
+        use std::time::Duration;
+
+        let rules = vec![
+            (
+                "ALPHA_UNIQUE".to_string(),
+                TagOutput {
+                    tags: Tags {
+                        topics: vec!["alpha-topic".into()],
+                        ..Default::default()
+                    },
+                    relations: vec![],
+                },
+            ),
+            (
+                "BETA_UNIQUE".to_string(),
+                TagOutput {
+                    tags: Tags {
+                        topics: vec!["beta-topic".into()],
+                        ..Default::default()
+                    },
+                    relations: vec![],
+                },
+            ),
+            (
+                "GAMMA_UNIQUE".to_string(),
+                TagOutput {
+                    tags: Tags {
+                        topics: vec!["gamma-topic".into()],
+                        ..Default::default()
+                    },
+                    relations: vec![],
+                },
+            ),
+        ];
+        let tagger = FakeTagger::with_substring(rules).with_delay(Duration::from_millis(30));
+
+        let a = capture_and_enqueue_tag(&pool, "content ALPHA_UNIQUE one").await;
+        let b = capture_and_enqueue_tag(&pool, "content BETA_UNIQUE two").await;
+        let c = capture_and_enqueue_tag(&pool, "content GAMMA_UNIQUE three").await;
+
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 3)
+            .await
+            .unwrap();
+        assert_eq!(report.processed, 3);
+        assert_eq!(report.completed, 3);
+        assert_eq!(report.failed_permanent, 0);
+
+        let ta = kengram_storage::fetch_thought_tags(&pool, a).await.unwrap().unwrap();
+        let tb = kengram_storage::fetch_thought_tags(&pool, b).await.unwrap().unwrap();
+        let tc = kengram_storage::fetch_thought_tags(&pool, c).await.unwrap().unwrap();
+        assert_eq!(ta.tags.topics, vec!["alpha-topic".to_string()]);
+        assert_eq!(tb.tags.topics, vec!["beta-topic".to_string()]);
+        assert_eq!(tc.tags.topics, vec!["gamma-topic".to_string()]);
+
+        let calls = tagger.all_calls();
+        assert_eq!(calls.len(), 3);
+        let contents: std::collections::HashSet<_> =
+            calls.into_iter().map(|c| c.content).collect();
+        assert!(contents.iter().any(|s| s.contains("ALPHA_UNIQUE")));
+        assert!(contents.iter().any(|s| s.contains("BETA_UNIQUE")));
+        assert!(contents.iter().any(|s| s.contains("GAMMA_UNIQUE")));
+    }
+
+    /// Watched RED: concurrency=1 is a throughput floor vs concurrency=3 under
+    /// artificial per-call delay — concurrent must finish strictly faster.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_tags_concurrency_gt_one_beats_sequential_floor(pool: PgPool) {
+        use std::time::{Duration, Instant};
+
+        let delay = Duration::from_millis(80);
+        let n = 6_i64;
+
+        for i in 0..n {
+            let _ = capture_and_enqueue_tag(&pool, &format!("seq item {i}")).await;
+        }
+        let tagger_seq = FakeTagger::new().with_delay(delay);
+        let t0 = Instant::now();
+        let r1 = drain_pending_tags(&pool, &tagger_seq, n, None, 1)
+            .await
+            .unwrap();
+        let seq_ms = t0.elapsed().as_millis();
+        assert_eq!(r1.completed as i64, n, "sequential completed");
+
+        for i in 0..n {
+            let _ = capture_and_enqueue_tag(&pool, &format!("par item {i}")).await;
+        }
+        let tagger_par = FakeTagger::new().with_delay(delay);
+        let t1 = Instant::now();
+        let r3 = drain_pending_tags(&pool, &tagger_par, n, None, 3)
+            .await
+            .unwrap();
+        let par_ms = t1.elapsed().as_millis();
+        assert_eq!(r3.completed as i64, n);
+
+        assert!(
+            par_ms * 10 < seq_ms * 7,
+            "concurrency=3 did not beat sequential floor: par_ms={par_ms} seq_ms={seq_ms}"
+        );
+        assert!(seq_ms >= delay.as_millis() * (n as u128) * 8 / 10);
+    }
+
+    /// One permanent poison thought must not stall the rest of a concurrent batch.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_tags_poison_job_does_not_stall_concurrent_batch(pool: PgPool) {
+        use kengram_core::{TagOutput, Tags};
+
+        let good = TagOutput {
+            tags: Tags {
+                topics: vec!["ok".into()],
+                ..Default::default()
+            },
+            relations: vec![],
+        };
+        let tagger = FakeTagger::with_substring(vec![("GOOD__".into(), good)]);
+
+        let poison =
+            capture_and_enqueue_tag(&pool, "POISON__TAG_JOB should fail permanent").await;
+        let g1 = capture_and_enqueue_tag(&pool, "GOOD__ one").await;
+        let g2 = capture_and_enqueue_tag(&pool, "GOOD__ two").await;
+        let g3 = capture_and_enqueue_tag(&pool, "GOOD__ three").await;
+
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 3)
+            .await
+            .unwrap();
+        assert_eq!(report.processed, 4);
+        assert_eq!(report.completed, 3);
+        assert_eq!(report.failed_permanent, 1);
+
+        for id in [g1, g2, g3] {
+            let t = kengram_storage::fetch_thought_tags(&pool, id).await.unwrap().unwrap();
+            assert_eq!(t.tags.topics, vec!["ok".to_string()]);
+        }
+        let remaining = kengram_storage::fetch_pending_tag_jobs(&pool, 10)
+            .await
+            .unwrap();
+        assert!(
+            remaining.iter().all(|j| j.thought_id != poison),
+            "poison job still pending"
+        );
     }
 }
