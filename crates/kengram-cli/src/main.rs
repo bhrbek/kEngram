@@ -632,6 +632,7 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
         contextual_chunk_vector_enabled,
         contextual_chunk_fts_enabled,
         counters: Some(search_counters.clone()),
+        rerank_timeout_ms: Some(config.reranker.timeout_seconds.saturating_mul(1000)),
     };
     tracing::info!(
         chunk_serving_enabled,
@@ -699,8 +700,7 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
         counters: search_counters.clone(),
         effective_timeouts: config.search.effective_timeouts_json(),
     };
-    let app = axum::Router::new()
-        .route("/health", axum::routing::get(health::health_handler))
+    let app = health::mount_health(axum::Router::new())
         .with_state(health_state)
         .nest_service("/mcp", mcp_service);
     let listener = tokio::net::TcpListener::bind(bind)

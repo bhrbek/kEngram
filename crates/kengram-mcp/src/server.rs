@@ -2513,6 +2513,136 @@ mod tests {
         assert!(results[0]["tags"].is_object());
     }
 
+    /// V4 — real KengramServer::search_thoughts handler emits degradations JSON.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_thoughts_tool_emits_degradations_json(pool: PgPool) {
+        use kengram_embed::FakeBehavior;
+        use std::sync::Arc;
+
+        // Seed lexical hit via working server, then search with failing embedder.
+        {
+            let s = server(pool.clone());
+            s.capture(Parameters(CaptureArgs {
+                content: "the tcgplayer integration was painful".into(),
+                source: "test".into(),
+                scope: Some("work".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
+            }))
+            .await
+            .unwrap();
+        }
+
+        let bad = Arc::new(FakeEmbedder::always_failing(
+            EmbeddingModel::new(TEST_EMBEDDER_MODEL_ID, 1024),
+            FakeBehavior::Unreachable,
+        ));
+        let counters = Arc::new(crate::degradation::SearchCounters::new());
+        let runtime = crate::search::SearchRuntimeOptions {
+            counters: Some(counters.clone()),
+            ..crate::search::SearchRuntimeOptions::default()
+        };
+        let s = KengramServer::new_with_query_expansion(
+            pool, bad, None, None, false, false, false, None, runtime,
+        );
+
+        let raw = s
+            .search_thoughts(Parameters(SearchThoughtsArgs {
+                query: "tcgplayer".into(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: None,
+                rerank: Some(false),
+                candidate_pool: None,
+                include_profile: Some(false),
+                tag_filter: None,
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            v.get("degradations").is_some(),
+            "MCP JSON must include degradations key"
+        );
+        let degs = v["degradations"].as_array().unwrap();
+        assert_eq!(degs.len(), 1);
+        assert_eq!(degs[0]["leg"], "query_embedding");
+        assert_eq!(degs[0]["reason"], "unreachable");
+        assert_eq!(v["vector_search_available"], false);
+        let results = v["results"].as_array().unwrap();
+        assert!(!results.is_empty());
+        let body = raw.to_lowercase();
+        assert!(!body.contains("postgres://"));
+        assert!(!body.contains("password"));
+        let snap = counters.snapshot(serde_json::json!({}));
+        assert_eq!(snap.degraded_requests_total, 1);
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "query_embedding" && c.reason == "unreachable")
+            .unwrap();
+        assert_eq!(cell.count, 1);
+    }
+
+    /// V4 control — healthy search produces empty degradations.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_thoughts_tool_healthy_no_degradation(pool: PgPool) {
+        use std::sync::Arc;
+
+        let counters = Arc::new(crate::degradation::SearchCounters::new());
+        let runtime = crate::search::SearchRuntimeOptions {
+            counters: Some(counters.clone()),
+            ..crate::search::SearchRuntimeOptions::default()
+        };
+        let s = KengramServer::new_with_query_expansion(
+            pool,
+            Arc::new(test_embedder()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            runtime,
+        );
+        s.capture(Parameters(CaptureArgs {
+            content: "healthy search control needle".into(),
+            source: "test".into(),
+            scope: Some("work".into()),
+            metadata: None,
+            argus_source_event: None,
+            source_created_at: None,
+            relation_intents: None,
+            correlation_id: None,
+        }))
+        .await
+        .unwrap();
+
+        let raw = s
+            .search_thoughts(Parameters(SearchThoughtsArgs {
+                query: "healthy search control".into(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: None,
+                rerank: Some(false),
+                candidate_pool: None,
+                include_profile: Some(false),
+                tag_filter: None,
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["degradations"].as_array().unwrap().len(), 0);
+        let snap = counters.snapshot(serde_json::json!({}));
+        assert_eq!(snap.degraded_requests_total, 0);
+        assert_eq!(snap.requests_total, 1);
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_tool_response_carries_tags_per_hit(pool: PgPool) {
         let s = server(pool.clone());

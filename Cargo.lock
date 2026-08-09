@@ -1607,6 +1607,7 @@ dependencies = [
  "axum",
  "clap",
  "figment",
+ "http-body-util",
  "kengram-core",
  "kengram-embed",
  "kengram-extract",
@@ -1622,6 +1623,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml 0.8.23",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1695,6 +1697,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

@@ -89,6 +89,8 @@ pub struct SearchRuntimeOptions {
     pub contextual_chunk_fts_enabled: bool,
     /// Process-local degradation counters (Delivery A). None in pure unit helpers.
     pub counters: Option<std::sync::Arc<SearchCounters>>,
+    /// Configured reranker HTTP timeout (ms) for degradation receipt accuracy.
+    pub rerank_timeout_ms: Option<u64>,
 }
 
 impl Default for SearchRuntimeOptions {
@@ -109,6 +111,7 @@ impl Default for SearchRuntimeOptions {
             contextual_chunk_vector_enabled: false,
             contextual_chunk_fts_enabled: false,
             counters: None,
+            rerank_timeout_ms: None,
         }
     }
 }
@@ -1028,7 +1031,7 @@ async fn search_thoughts_with_tuning(
                 counters.as_ref(),
                 &mut degradations,
                 search_seq,
-                None,
+                runtime.rerank_timeout_ms,
             )
             .await
         }
@@ -2360,8 +2363,12 @@ mod tests {
         EmbedderError, EmbeddingModel, LinkDirection, LinkSource, LinkTarget, RelationKind,
         SparseEmbeddingModel, SparseLexicalVector, SparseWeight, TagKind, Tags,
     };
-    use kengram_embed::{FakeBehavior, FakeEmbedder, FakeReranker};
+    use kengram_embed::{FakeBehavior, FakeEmbedder, FakeReranker, TeiReranker, TeiRerankerConfig};
     use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const TEST_EMBEDDER_MODEL_ID: &str = "qwen3-embedding";
 
@@ -2756,10 +2763,16 @@ mod tests {
         let id = cap(&pool, "the tcgplayer integration was painful", "work").await;
 
         let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
-        let resp = search_thoughts(
+        let counters = Arc::new(SearchCounters::new());
+        let resp = search_thoughts_with_runtime(
             &pool,
             &bad,
             None,
+            None,
+            SearchRuntimeOptions {
+                counters: Some(counters.clone()),
+                ..SearchRuntimeOptions::default()
+            },
             SearchRequest {
                 query: "tcgplayer".to_string(),
                 scope: None,
@@ -2788,6 +2801,15 @@ mod tests {
         );
         assert_eq!(resp.results.len(), 1);
         assert_eq!(resp.results[0].thought_id, id);
+        let snap = counters.snapshot(serde_json::json!({}));
+        assert_eq!(snap.requests_total, 1);
+        assert_eq!(snap.degraded_requests_total, 1);
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "query_embedding" && c.reason == "unreachable")
+            .unwrap();
+        assert_eq!(cell.count, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -2886,57 +2908,71 @@ mod tests {
         assert_eq!(hit.chunk_index, Some(0));
     }
 
+    /// V2 — FTS timeout, causally armed.
+    /// 1) ACCESS EXCLUSIVE + production search_fts_bounded proves SQLSTATE 57014.
+    /// 2) Load + short statement_timeout re-arms cancel for the orchestrator so a
+    ///    healthy vector leg can complete (vector has no statement_timeout; FTS does).
     #[sqlx::test(migrations = "../../migrations")]
-    async fn search_thoughts_soft_fails_timed_out_fts_leg(pool: PgPool) {
+    async fn search_thoughts_fts_timeout_causally_armed(pool: PgPool) {
         let embedder = test_embedder();
-        let needle = "needle vector anchor";
+        let needle = "causal fts cancel needle vector anchor";
         let needle_id = cap_and_drain(&pool, &embedder, needle, "global").await;
 
-        for i in 0..512 {
+        // (1) Capability arming against production bounded storage.
+        {
+            let mut blocker = pool.begin().await.unwrap();
+            sqlx::query("LOCK TABLE thoughts IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *blocker)
+                .await
+                .unwrap();
+            let started = std::time::Instant::now();
+            let err = kengram_storage::search_fts_bounded(&pool, needle, None, None, 10, 50)
+                .await
+                .expect_err("locked thoughts must cancel bounded FTS");
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(800),
+                "statement_timeout should cancel the blocked FTS query promptly"
+            );
+            assert!(
+                err.is_query_canceled(),
+                "expected Postgres query-canceled (57014) before swallow, got {err:?}"
+            );
+            blocker.rollback().await.unwrap();
+        }
+
+        // (2) Orchestrator: force FTS cancel via short budget + load; vector remains healthy.
+        for i in 0..256 {
             cap(
                 &pool,
                 &format!(
-                    "bounded fts load filler {i} needle vector anchor {}",
-                    "surface noise ".repeat(350)
+                    "bounded fts load filler {i} causal fts cancel needle vector anchor {}",
+                    "surface noise ".repeat(400)
                 ),
                 "load",
             )
             .await;
         }
 
-        let started = std::time::Instant::now();
-        let lexical_hits = {
-            let mut deg = Vec::new();
-            bounded_fts_hits(
-                &pool,
-                needle,
-                None,
-                None,
-                DEFAULT_LEXICAL_TOP_K,
-                1,
-                None,
-                &mut deg,
-                0,
-                SearchLeg::ThoughtFts,
-            )
+        // Re-arm: production bounded call must still cancel under this load+budget.
+        let err = kengram_storage::search_fts_bounded(&pool, needle, None, None, 50, 1)
             .await
-        };
+            .expect_err("load+1ms must cancel bounded FTS");
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(800),
-            "timed-out FTS leg should return inside its budget"
-        );
-        assert!(
-            lexical_hits.is_empty(),
-            "timed-out FTS leg must soft-fail to an empty leg"
+            err.is_query_canceled(),
+            "load fixture must yield query-canceled before orchestrator credit, got {err:?}"
         );
 
+        let counters = Arc::new(SearchCounters::new());
         let resp = search_thoughts_with_tuning(
             &pool,
             &embedder,
             None,
             None,
             None,
-            SearchRuntimeOptions::default(),
+            SearchRuntimeOptions {
+                counters: Some(counters.clone()),
+                ..SearchRuntimeOptions::default()
+            },
             SearchRequest {
                 query: needle.to_string(),
                 scope: None,
@@ -2959,13 +2995,165 @@ mod tests {
         .unwrap();
 
         assert!(resp.vector_search_available);
+        let fts_deg = resp
+            .degradations
+            .iter()
+            .find(|d| d.leg == SearchLeg::ThoughtFts)
+            .expect("thought_fts degradation required");
+        assert_eq!(fts_deg.reason, DegradationReason::Timeout);
+        assert_eq!(fts_deg.fallback, DegradationFallback::AvailableSearchLegs);
+        assert_eq!(fts_deg.timeout_ms, Some(1));
+        assert_eq!(fts_deg.failed_attempts, 1);
         assert!(
-            resp.results.iter().any(|hit| hit.thought_id == needle_id
-                && hit.vector_score.is_some()
-                && hit.lexical_score.is_none()
-                && hit.trigram_score.is_none()),
-            "outer search should still return vector results when FTS times out"
+            resp.results
+                .iter()
+                .any(|hit| hit.thought_id == needle_id && hit.vector_score.is_some()),
+            "vector result must survive FTS cancel"
         );
+
+        let snap = counters.snapshot(serde_json::json!({}));
+        assert_eq!(snap.requests_total, 1);
+        assert_eq!(snap.degraded_requests_total, 1);
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "thought_fts" && c.reason == "timeout")
+            .expect("thought_fts/timeout cell");
+        assert_eq!(cell.count, 1);
+        let qe = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "query_embedding" && c.reason == "timeout")
+            .unwrap();
+        assert_eq!(qe.count, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_thoughts_soft_fails_timed_out_fts_leg(pool: PgPool) {
+        let embedder = test_embedder();
+        let needle = "legacy soft-fail alias needle";
+        let _needle_id = cap_and_drain(&pool, &embedder, needle, "global").await;
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE thoughts IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let err = kengram_storage::search_fts_bounded(&pool, needle, None, None, 10, 50)
+            .await
+            .unwrap_err();
+        assert!(
+            err.is_query_canceled(),
+            "causal arm required before soft-fail credit, got {err:?}"
+        );
+
+        let mut deg = Vec::new();
+        let counters = Arc::new(SearchCounters::new());
+        let lexical_hits = bounded_fts_hits(
+            &pool,
+            needle,
+            None,
+            None,
+            DEFAULT_LEXICAL_TOP_K,
+            50,
+            Some(&counters),
+            &mut deg,
+            1,
+            SearchLeg::ThoughtFts,
+        )
+        .await;
+        blocker.rollback().await.unwrap();
+
+        assert!(lexical_hits.is_empty());
+        assert_eq!(deg.len(), 1);
+        assert_eq!(deg[0].leg, SearchLeg::ThoughtFts);
+        assert_eq!(deg[0].reason, DegradationReason::Timeout);
+        let snap = counters.snapshot(serde_json::json!({}));
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "thought_fts" && c.reason == "timeout")
+            .unwrap();
+        assert_eq!(cell.count, 1);
+    }
+
+    /// V3 — reranker timeout through production TeiReranker + WireMock delay.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_thoughts_rerank_timeout_via_tei_wiremock(pool: PgPool) {
+        let embedder = test_embedder();
+        let _a = cap_and_drain(&pool, &embedder, "alpha candidate about widgets", "global").await;
+        let _b = cap_and_drain(&pool, &embedder, "beta candidate about gadgets", "global").await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rerank"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+
+        let tei = TeiReranker::new(TeiRerankerConfig {
+            endpoint: server.uri(),
+            model_id: "BAAI/bge-reranker-v2-m3".into(),
+            timeout: Duration::from_secs(1),
+        })
+        .unwrap();
+
+        let counters = Arc::new(SearchCounters::new());
+        let resp = search_thoughts_with_tuning(
+            &pool,
+            &embedder,
+            None,
+            Some(&tei as &dyn kengram_embed::Reranker),
+            None,
+            SearchRuntimeOptions {
+                counters: Some(counters.clone()),
+                rerank_timeout_ms: Some(1000),
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: "widgets gadgets".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(true),
+                candidate_pool: Some(10),
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
+                include_profile: false,
+            },
+            DEFAULT_LEXICAL_TOP_K,
+            DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            DEFAULT_RERANK_CANDIDATE_POOL,
+        )
+        .await
+        .unwrap();
+
+        assert!(!resp.rerank_used);
+        assert_eq!(resp.degradations.len(), 1);
+        assert_eq!(resp.degradations[0].leg, SearchLeg::Rerank);
+        assert_eq!(resp.degradations[0].reason, DegradationReason::Timeout);
+        assert_eq!(
+            resp.degradations[0].fallback,
+            DegradationFallback::RrfRecency
+        );
+        assert_eq!(resp.degradations[0].timeout_ms, Some(1000));
+        assert!(
+            !resp.results.is_empty(),
+            "RRF order must survive rerank timeout"
+        );
+
+        let snap = counters.snapshot(serde_json::json!({}));
+        assert_eq!(snap.requests_total, 1);
+        assert_eq!(snap.degraded_requests_total, 1);
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "rerank" && c.reason == "timeout")
+            .unwrap();
+        assert_eq!(cell.count, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
