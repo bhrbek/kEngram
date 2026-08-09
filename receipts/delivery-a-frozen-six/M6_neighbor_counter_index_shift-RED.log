@@ -1,0 +1,16 @@
+$ cargo test -p kengram-mcp --lib record_increments_exact_cell -- --test-threads=1 --nocapture
+exit=101
+
+--- stdout ---
+
+--- stderr ---
+   Compiling kengram-mcp v0.2.0 (/private/tmp/kengram-pr20-heavy-test/crates/kengram-mcp)
+error[E0425]: cannot find value `neighbor` in this scope
+   --> crates/kengram-mcp/src/degradation.rs:404:20
+    |
+404 |         assert_eq!(neighbor.count, 1, "KENGRAM_DELIVERY_A_RED:M6_counter_index"); // MUTANT neighbor shift
+    |                    ^^^^^^^^ not found in this scope
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `kengram-mcp` (lib test) due to 1 previous error
+

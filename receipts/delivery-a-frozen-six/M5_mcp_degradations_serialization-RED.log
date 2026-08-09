@@ -1,0 +1,26 @@
+$ cargo test -p kengram-mcp --lib search_thoughts_tool_emits_degradations_json -- --test-threads=1 --nocapture
+exit=101
+
+--- stdout ---
+
+running 1 test
+test server::tests::search_thoughts_tool_emits_degradations_json ... FAILED
+
+failures:
+
+failures:
+    server::tests::search_thoughts_tool_emits_degradations_json
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 233 filtered out; finished in 1.15s
+
+
+--- stderr ---
+   Compiling kengram-mcp v0.2.0 (/private/tmp/kengram-pr20-heavy-test/crates/kengram-mcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.21s
+     Running unittests src/lib.rs (target/debug/deps/kengram_mcp-32be49a246a715bd)
+
+thread 'server::tests::search_thoughts_tool_emits_degradations_json' (420642365) panicked at crates/kengram-mcp/src/server.rs:2567:9:
+KENGRAM_DELIVERY_A_RED:V4_mcp_degradations_serialization
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p kengram-mcp --lib`
+

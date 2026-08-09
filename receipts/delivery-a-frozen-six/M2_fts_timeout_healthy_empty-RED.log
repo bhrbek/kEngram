@@ -1,0 +1,28 @@
+$ cargo test -p kengram-mcp --lib search_thoughts_soft_fails_timed_out_fts_leg -- --test-threads=1 --nocapture
+exit=101
+
+--- stdout ---
+
+running 1 test
+test search::tests::search_thoughts_soft_fails_timed_out_fts_leg ... FAILED
+
+failures:
+
+failures:
+    search::tests::search_thoughts_soft_fails_timed_out_fts_leg
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 233 filtered out; finished in 1.40s
+
+
+--- stderr ---
+   Compiling kengram-mcp v0.2.0 (/private/tmp/kengram-pr20-heavy-test/crates/kengram-mcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.63s
+     Running unittests src/lib.rs (target/debug/deps/kengram_mcp-32be49a246a715bd)
+
+thread 'search::tests::search_thoughts_soft_fails_timed_out_fts_leg' (420626832) panicked at crates/kengram-mcp/src/search.rs:3298:9:
+assertion `left == right` failed
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p kengram-mcp --lib`
+

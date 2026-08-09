@@ -1,0 +1,63 @@
+$ cargo test -p kengram-mcp --lib rerank_timeout -- --test-threads=1 --nocapture
+exit=101
+
+--- stdout ---
+
+running 1 test
+test search::tests::search_thoughts_rerank_timeout_via_tei_wiremock ... FAILED
+
+failures:
+
+failures:
+    search::tests::search_thoughts_rerank_timeout_via_tei_wiremock
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 233 filtered out; finished in 2.34s
+
+
+--- stderr ---
+   Compiling kengram-mcp v0.2.0 (/private/tmp/kengram-pr20-heavy-test/crates/kengram-mcp)
+warning: unused import: `reason_from_reranker`
+  --> crates/kengram-mcp/src/search.rs:23:27
+   |
+23 |     reason_from_embedder, reason_from_reranker, record_degradation,
+   |                           ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `counters`
+    --> crates/kengram-mcp/src/search.rs:2328:5
+     |
+2328 |     counters: Option<&std::sync::Arc<SearchCounters>>,
+     |     ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_counters`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `degradations`
+    --> crates/kengram-mcp/src/search.rs:2329:5
+     |
+2329 |     degradations: &mut Vec<SearchDegradation>,
+     |     ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_degradations`
+
+warning: unused variable: `search_seq`
+    --> crates/kengram-mcp/src/search.rs:2330:5
+     |
+2330 |     search_seq: u64,
+     |     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_search_seq`
+
+warning: unused variable: `rerank_timeout_ms`
+    --> crates/kengram-mcp/src/search.rs:2331:5
+     |
+2331 |     rerank_timeout_ms: Option<u64>,
+     |     ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_rerank_timeout_ms`
+
+warning: `kengram-mcp` (lib test) generated 5 warnings (run `cargo fix --lib -p kengram-mcp --tests` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.19s
+     Running unittests src/lib.rs (target/debug/deps/kengram_mcp-32be49a246a715bd)
+
+thread 'search::tests::search_thoughts_rerank_timeout_via_tei_wiremock' (420630572) panicked at crates/kengram-mcp/src/search.rs:3467:9:
+assertion `left == right` failed: KENGRAM_DELIVERY_A_RED:V3_rerank_timeout_receipt
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p kengram-mcp --lib`
+

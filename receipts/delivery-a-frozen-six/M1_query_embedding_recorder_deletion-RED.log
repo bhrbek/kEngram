@@ -1,0 +1,43 @@
+$ cargo test -p kengram-mcp --lib search_thoughts_degrades_when_embedder_fails -- --test-threads=1 --nocapture
+exit=101
+
+--- stdout ---
+
+running 1 test
+test search::tests::search_thoughts_degrades_when_embedder_fails ... FAILED
+
+failures:
+
+failures:
+    search::tests::search_thoughts_degrades_when_embedder_fails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 233 filtered out; finished in 1.84s
+
+
+--- stderr ---
+   Compiling kengram-mcp v0.2.0 (/private/tmp/kengram-pr20-heavy-test/crates/kengram-mcp)
+warning: unused variable: `reason`
+   --> crates/kengram-mcp/src/search.rs:630:17
+    |
+630 |             let reason = reason_from_embedder(&e);
+    |                 ^^^^^^ help: if this is intentional, prefix it with an underscore: `_reason`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `timeout_ms`
+   --> crates/kengram-mcp/src/search.rs:631:17
+    |
+631 |             let timeout_ms = match &e {
+    |                 ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_timeout_ms`
+
+warning: `kengram-mcp` (lib test) generated 2 warnings (run `cargo fix --lib -p kengram-mcp --tests` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.12s
+     Running unittests src/lib.rs (target/debug/deps/kengram_mcp-32be49a246a715bd)
+
+thread 'search::tests::search_thoughts_degrades_when_embedder_fails' (420623590) panicked at crates/kengram-mcp/src/search.rs:3006:9:
+assertion `left == right` failed: KENGRAM_DELIVERY_A_RED:V1_query_embedding_receipt
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p kengram-mcp --lib`
+
