@@ -121,7 +121,11 @@ pub struct SearchConfig {
     pub query_expansion_prompt_version: String,
     pub query_expansion_max_hyde_chars: usize,
     // Delivery A: explicit lexical statement timeouts (ms). Defaults preserve
-    // DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS = 300.
+    // DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS = 300. Figment env examples:
+    // KENGRAM_SEARCH__THOUGHT_FTS_TIMEOUT_MS, KENGRAM_SEARCH__CHUNK_FTS_TIMEOUT_MS,
+    // KENGRAM_SEARCH__CONTEXTUAL_CHUNK_FTS_TIMEOUT_MS, KENGRAM_SEARCH__PAIRWISE_CHUNK_FTS_TIMEOUT_MS,
+    // KENGRAM_SEARCH__DOMAIN_SCOPE_TIMEOUT_MS, KENGRAM_SEARCH__TAG_FACET_TIMEOUT_MS,
+    // KENGRAM_SEARCH__EXPANSION_FTS_TIMEOUT_MS.
     pub thought_fts_timeout_ms: u64,
     pub chunk_fts_timeout_ms: u64,
     pub contextual_chunk_fts_timeout_ms: u64,

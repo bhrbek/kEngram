@@ -91,6 +91,14 @@ pub struct SearchRuntimeOptions {
     pub counters: Option<std::sync::Arc<SearchCounters>>,
     /// Configured reranker HTTP timeout (ms) for degradation receipt accuracy.
     pub rerank_timeout_ms: Option<u64>,
+    /// Per-leg lexical statement timeouts (ms). Defaults preserve 300 ms.
+    pub thought_fts_timeout_ms: u64,
+    pub chunk_fts_timeout_ms: u64,
+    pub contextual_chunk_fts_timeout_ms: u64,
+    pub pairwise_chunk_fts_timeout_ms: u64,
+    pub domain_scope_timeout_ms: u64,
+    pub tag_facet_timeout_ms: u64,
+    pub expansion_fts_timeout_ms: u64,
 }
 
 impl Default for SearchRuntimeOptions {
@@ -112,6 +120,13 @@ impl Default for SearchRuntimeOptions {
             contextual_chunk_fts_enabled: false,
             counters: None,
             rerank_timeout_ms: None,
+            thought_fts_timeout_ms: DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            chunk_fts_timeout_ms: DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            contextual_chunk_fts_timeout_ms: DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            pairwise_chunk_fts_timeout_ms: DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            domain_scope_timeout_ms: DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            tag_facet_timeout_ms: DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
+            expansion_fts_timeout_ms: DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
         }
     }
 }
@@ -483,6 +498,52 @@ async fn search_thoughts_with_tuning(
     }
     let search_seq = counters.as_ref().map(|c| c.next_search_seq()).unwrap_or(0);
     let mut degradations: Vec<SearchDegradation> = Vec::new();
+    // Route per-leg lexical budgets from runtime. When all seven still equal the
+    // compile-time default, honor the legacy single lexical_timeout_ms argument
+    // (tests override that way). Production sets unequal values on runtime.
+    let lexical_all_default = runtime.thought_fts_timeout_ms
+        == DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS
+        && runtime.chunk_fts_timeout_ms == DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS
+        && runtime.contextual_chunk_fts_timeout_ms == DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS
+        && runtime.pairwise_chunk_fts_timeout_ms == DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS
+        && runtime.domain_scope_timeout_ms == DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS
+        && runtime.tag_facet_timeout_ms == DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS
+        && runtime.expansion_fts_timeout_ms == DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS;
+    let thought_fts_timeout_ms = if lexical_all_default {
+        lexical_timeout_ms
+    } else {
+        runtime.thought_fts_timeout_ms
+    };
+    let chunk_fts_timeout_ms = if lexical_all_default {
+        lexical_timeout_ms
+    } else {
+        runtime.chunk_fts_timeout_ms
+    };
+    let contextual_chunk_fts_timeout_ms = if lexical_all_default {
+        lexical_timeout_ms
+    } else {
+        runtime.contextual_chunk_fts_timeout_ms
+    };
+    let pairwise_chunk_fts_timeout_ms = if lexical_all_default {
+        lexical_timeout_ms
+    } else {
+        runtime.pairwise_chunk_fts_timeout_ms
+    };
+    let domain_scope_timeout_ms = if lexical_all_default {
+        lexical_timeout_ms
+    } else {
+        runtime.domain_scope_timeout_ms
+    };
+    let tag_facet_timeout_ms = if lexical_all_default {
+        lexical_timeout_ms
+    } else {
+        runtime.tag_facet_timeout_ms
+    };
+    let expansion_fts_timeout_ms = if lexical_all_default {
+        lexical_timeout_ms
+    } else {
+        runtime.expansion_fts_timeout_ms
+    };
     let mut profile = SearchProfile {
         parent_resolution_mode: "sql_join_in_retrieval_legs",
         ..SearchProfile::default()
@@ -550,6 +611,9 @@ async fn search_thoughts_with_tuning(
         &runtime,
         &query,
         &mut profile,
+        counters.as_ref(),
+        &mut degradations,
+        search_seq,
     )
     .await;
 
@@ -774,7 +838,7 @@ async fn search_thoughts_with_tuning(
         scope_filter,
         scope_prefix_filter,
         lexical_top_k,
-        lexical_timeout_ms,
+        thought_fts_timeout_ms,
         counters.as_ref(),
         &mut degradations,
         search_seq,
@@ -791,7 +855,7 @@ async fn search_thoughts_with_tuning(
             scope_filter,
             scope_prefix_filter,
             lexical_top_k,
-            lexical_timeout_ms,
+            chunk_fts_timeout_ms,
             counters.as_ref(),
             &mut degradations,
             search_seq,
@@ -812,7 +876,7 @@ async fn search_thoughts_with_tuning(
             scope_filter,
             scope_prefix_filter,
             lexical_top_k,
-            lexical_timeout_ms,
+            contextual_chunk_fts_timeout_ms,
             counters.as_ref(),
             &mut degradations,
             search_seq,
@@ -834,7 +898,7 @@ async fn search_thoughts_with_tuning(
             scope_filter,
             scope_prefix_filter,
             lexical_top_k,
-            lexical_timeout_ms,
+            pairwise_chunk_fts_timeout_ms,
             counters.as_ref(),
             &mut degradations,
             search_seq,
@@ -859,7 +923,7 @@ async fn search_thoughts_with_tuning(
             scope_filter,
             scope_prefix_filter,
             lexical_top_k,
-            lexical_timeout_ms,
+            domain_scope_timeout_ms,
             counters.as_ref(),
             &mut degradations,
             search_seq,
@@ -876,7 +940,7 @@ async fn search_thoughts_with_tuning(
             scope_filter,
             scope_prefix_filter,
             lexical_top_k,
-            lexical_timeout_ms,
+            tag_facet_timeout_ms,
             counters.as_ref(),
             &mut degradations,
             search_seq,
@@ -902,7 +966,7 @@ async fn search_thoughts_with_tuning(
             scope_filter,
             scope_prefix_filter,
             lexical_top_k,
-            lexical_timeout_ms,
+            expansion_fts_timeout_ms,
             &mut profile,
             counters.as_ref(),
             &mut degradations,
@@ -1090,6 +1154,9 @@ async fn build_expansion_plan(
     runtime: &SearchRuntimeOptions,
     query: &str,
     profile: &mut SearchProfile,
+    counters: Option<&std::sync::Arc<SearchCounters>>,
+    degradations: &mut Vec<SearchDegradation>,
+    search_seq: u64,
 ) -> Option<ExpansionPlan> {
     if !query_expansion_enabled {
         return None;
@@ -1144,6 +1211,41 @@ async fn build_expansion_plan(
                 reason = e.reason_code(),
                 "query expansion provider failed; falling back to original-query-only retrieval",
             );
+            let reason = match &e {
+                crate::query_expansion::QueryExpansionError::Timeout { .. } => {
+                    DegradationReason::Timeout
+                }
+                crate::query_expansion::QueryExpansionError::Unreachable(_) => {
+                    DegradationReason::Unreachable
+                }
+                crate::query_expansion::QueryExpansionError::Backend { .. } => {
+                    DegradationReason::Backend
+                }
+                crate::query_expansion::QueryExpansionError::MalformedResponse(_) => {
+                    DegradationReason::Malformed
+                }
+                crate::query_expansion::QueryExpansionError::Misconfigured(_) => {
+                    DegradationReason::Misconfigured
+                }
+            };
+            let timeout_ms = match &e {
+                crate::query_expansion::QueryExpansionError::Timeout { seconds } => {
+                    Some(seconds.saturating_mul(1000))
+                }
+                _ => None,
+            };
+            record_degradation(
+                counters,
+                degradations,
+                SearchDegradation::new(
+                    SearchLeg::QueryExpansion,
+                    reason,
+                    DegradationFallback::OriginalQuery,
+                    timeout_ms,
+                    1,
+                ),
+                search_seq,
+            );
             profile.query_expansion_fallback = true;
             profile.query_expansion_fallback_reason = Some(e.reason_code().to_string());
             profile.query_expansion_ms = elapsed_ms(started);
@@ -1197,6 +1299,23 @@ async fn collect_expansion_rankings(
                             error = %e,
                             "query-expansion thought vector leg failed; continuing",
                         );
+                        let reason = if e.is_query_canceled() {
+                            DegradationReason::Timeout
+                        } else {
+                            DegradationReason::Storage
+                        };
+                        record_degradation(
+                            counters,
+                            degradations,
+                            SearchDegradation::new(
+                                SearchLeg::ExpansionThoughtVector,
+                                reason,
+                                DegradationFallback::AvailableSearchLegs,
+                                None,
+                                1,
+                            ),
+                            search_seq,
+                        );
                     }
                 }
                 if chunk_serving_enabled {
@@ -1221,6 +1340,23 @@ async fn collect_expansion_rankings(
                                 error = %e,
                                 "query-expansion chunk vector leg failed; continuing",
                             );
+                            let reason = if e.is_query_canceled() {
+                                DegradationReason::Timeout
+                            } else {
+                                DegradationReason::Storage
+                            };
+                            record_degradation(
+                                counters,
+                                degradations,
+                                SearchDegradation::new(
+                                    SearchLeg::ExpansionChunkVector,
+                                    reason,
+                                    DegradationFallback::AvailableSearchLegs,
+                                    None,
+                                    1,
+                                ),
+                                search_seq,
+                            );
                         }
                     }
                 }
@@ -1230,6 +1366,25 @@ async fn collect_expansion_rankings(
             tracing::warn!(
                 error = %e,
                 "embedder failed for query-expansion variants; keeping lexical expansion legs only",
+            );
+            let reason = reason_from_embedder(&e);
+            let timeout_ms = match &e {
+                kengram_core::EmbedderError::Timeout { seconds } => {
+                    Some(seconds.saturating_mul(1000))
+                }
+                _ => None,
+            };
+            record_degradation(
+                counters,
+                degradations,
+                SearchDegradation::new(
+                    SearchLeg::ExpansionEmbedding,
+                    reason,
+                    DegradationFallback::AvailableSearchLegs,
+                    timeout_ms,
+                    1,
+                ),
+                search_seq,
             );
         }
     }
@@ -2792,7 +2947,11 @@ mod tests {
         .unwrap();
 
         assert!(!resp.vector_search_available);
-        assert_eq!(resp.degradations.len(), 1);
+        assert_eq!(
+            resp.degradations.len(),
+            1,
+            "KENGRAM_DELIVERY_A_RED:V1_query_embedding_receipt"
+        );
         assert_eq!(resp.degradations[0].leg, SearchLeg::QueryEmbedding);
         assert_eq!(resp.degradations[0].reason, DegradationReason::Unreachable);
         assert_eq!(
@@ -2999,7 +3158,7 @@ mod tests {
             .degradations
             .iter()
             .find(|d| d.leg == SearchLeg::ThoughtFts)
-            .expect("thought_fts degradation required");
+            .expect("KENGRAM_DELIVERY_A_RED:V2_thought_fts_timeout_receipt");
         assert_eq!(fts_deg.reason, DegradationReason::Timeout);
         assert_eq!(fts_deg.fallback, DegradationFallback::AvailableSearchLegs);
         assert_eq!(fts_deg.timeout_ms, Some(1));
@@ -3078,6 +3237,55 @@ mod tests {
     }
 
     /// V3 — reranker timeout through production TeiReranker + WireMock delay.
+
+    /// V2 fan-out: pairwise subqueries accumulate failed_attempts on one logical receipt.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_pairwise_fts_timeout_failed_attempts_aggregated(pool: PgPool) {
+        ensure_test_chunk_schema(&pool).await;
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE artifact_chunks IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let mut deg = Vec::new();
+        let counters = Arc::new(SearchCounters::new());
+        let hits = bounded_pairwise_artifact_chunk_fts_hits(
+            &pool,
+            "alpha beta gamma",
+            None,
+            None,
+            DEFAULT_LEXICAL_TOP_K,
+            50,
+            Some(&counters),
+            &mut deg,
+            1,
+            SearchLeg::PairwiseChunkFts,
+        )
+        .await;
+        blocker.rollback().await.unwrap();
+
+        assert!(hits.is_empty());
+        assert_eq!(
+            deg.len(),
+            1,
+            "KENGRAM_DELIVERY_A_RED:V2_pairwise_one_logical_receipt"
+        );
+        assert_eq!(deg[0].leg, SearchLeg::PairwiseChunkFts);
+        assert_eq!(deg[0].reason, DegradationReason::Timeout);
+        assert_eq!(
+            deg[0].failed_attempts, 2,
+            "KENGRAM_DELIVERY_A_RED:V2_pairwise_failed_attempts"
+        );
+        let snap = counters.snapshot(serde_json::json!({}));
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "pairwise_chunk_fts" && c.reason == "timeout")
+            .unwrap();
+        assert_eq!(cell.count, 1);
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_rerank_timeout_via_tei_wiremock(pool: PgPool) {
         let embedder = test_embedder();
@@ -3132,7 +3340,11 @@ mod tests {
         .unwrap();
 
         assert!(!resp.rerank_used);
-        assert_eq!(resp.degradations.len(), 1);
+        assert_eq!(
+            resp.degradations.len(),
+            1,
+            "KENGRAM_DELIVERY_A_RED:V3_rerank_timeout_receipt"
+        );
         assert_eq!(resp.degradations[0].leg, SearchLeg::Rerank);
         assert_eq!(resp.degradations[0].reason, DegradationReason::Timeout);
         assert_eq!(
@@ -3852,6 +4064,7 @@ mod tests {
         let expander = StaticQueryExpander {
             output: Err(QueryExpansionError::Timeout { seconds: 1 }),
         };
+        let counters = Arc::new(SearchCounters::new());
         let resp = search_thoughts_with_runtime(
             &pool,
             &embedder,
@@ -3860,6 +4073,7 @@ mod tests {
             SearchRuntimeOptions {
                 query_expansion_enabled: true,
                 hyde_enabled: true,
+                counters: Some(counters.clone()),
                 ..SearchRuntimeOptions::default()
             },
             SearchRequest {
@@ -3890,6 +4104,25 @@ mod tests {
             Some("timeout")
         );
         assert_eq!(profile.query_expansion_variant_count, 0);
+        assert_eq!(
+            resp.degradations.len(),
+            1,
+            "KENGRAM_DELIVERY_A_RED:F2_query_expansion_receipt"
+        );
+        assert_eq!(resp.degradations[0].leg, SearchLeg::QueryExpansion);
+        assert_eq!(resp.degradations[0].reason, DegradationReason::Timeout);
+        assert_eq!(
+            resp.degradations[0].fallback,
+            DegradationFallback::OriginalQuery
+        );
+        let snap = counters.snapshot(serde_json::json!({}));
+        assert_eq!(snap.degraded_requests_total, 1);
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "query_expansion" && c.reason == "timeout")
+            .unwrap();
+        assert_eq!(cell.count, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -3907,6 +4140,7 @@ mod tests {
                 facets: Default::default(),
             }),
         };
+        let counters = Arc::new(SearchCounters::new());
         let resp = search_thoughts_with_runtime(
             &pool,
             &bad,
@@ -3917,6 +4151,7 @@ mod tests {
                 hyde_enabled: true,
                 query_expansion_max_variants: 4,
                 query_expansion_max_hyde_chars: 600,
+                counters: Some(counters.clone()),
                 ..SearchRuntimeOptions::default()
             },
             SearchRequest {
@@ -3946,6 +4181,26 @@ mod tests {
         assert_eq!(profile.query_expansion_variant_count, 1);
         assert!(profile.query_expansion_hyde_used);
         assert!(profile.query_expansion_thought_fts_hits >= 2);
+        // Bad embedder fails primary query_embedding AND expansion_embedding.
+        assert!(
+            resp.degradations
+                .iter()
+                .any(|d| d.leg == SearchLeg::ExpansionEmbedding),
+            "KENGRAM_DELIVERY_A_RED:F2_expansion_embedding_receipt"
+        );
+        assert!(
+            resp.degradations
+                .iter()
+                .any(|d| d.leg == SearchLeg::QueryEmbedding),
+            "primary query embed also degrades"
+        );
+        let snap = counters.snapshot(serde_json::json!({}));
+        let cell = snap
+            .leg_degradations_total
+            .iter()
+            .find(|c| c.leg == "expansion_embedding" && c.reason == "unreachable")
+            .unwrap();
+        assert_eq!(cell.count, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
