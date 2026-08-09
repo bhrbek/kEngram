@@ -121,9 +121,9 @@ source_manifest() {
   awk -F '|' 'NR > 1 && $1 == previous { exit 7 } { previous = $1 }' "$output" || fail "duplicate migration version"
 }
 
-assert_exact_1_37() {
+assert_exact_1_35() {
   manifest="$1"
-  awk -F '|' 'NR != $1 { exit 7 } END { if (NR != 37) exit 8 }' "$manifest" || fail "source versions are not exactly 1..37"
+  awk -F '|' 'NR != $1 { exit 7 } END { if (NR != 35) exit 8 }' "$manifest" || fail "source versions are not exactly 1..35"
 }
 
 assert_info_matches_manifest() {
@@ -165,9 +165,37 @@ assert_state_equal() {
   done
 }
 
+# This suite is 0035-scoped: apply --target-version 35 and compare a 35-row ledger.
+# Later migrations (0036 multi-DB, 0037 ANN historical drop, …) must not expand
+# FULL_MANIFEST or sqlx --source for this harness. Build a disposable 1..35 view.
+SCOPED_MIGRATIONS="$WORK/migrations-1-35"
+mkdir -p "$SCOPED_MIGRATIONS"
+for f in "$MIGRATIONS"/*.sql; do
+  base="$(basename "$f")"
+  case "$base" in
+    *_*.sql) ;;
+    *) fail "unparseable migration filename while scoping: $base" ;;
+  esac
+  prefix="${base%%_*}"
+  digits="$prefix"
+  case "$prefix" in
+    +*) digits="${prefix#+}" ;;
+    -*) digits="${prefix#-}" ;;
+  esac
+  case "$digits" in
+    ''|*[!0-9]*) fail "unparseable version while scoping: $base" ;;
+  esac
+  version="$(printf '%s\n' "$digits" | sed 's/^0*//')"
+  test -n "$version" || version=0
+  if test "$version" -le 35; then
+    cp "$f" "$SCOPED_MIGRATIONS/"
+  fi
+done
+MIGRATIONS="$SCOPED_MIGRATIONS"
+
 FULL_MANIFEST="$WORK/source.manifest"
 source_manifest "$MIGRATIONS" "$FULL_MANIFEST"
-assert_exact_1_37 "$FULL_MANIFEST"
+assert_exact_1_35 "$FULL_MANIFEST"
 
 test "$(shasum -a 256 "$MIGRATIONS/0031_doc_source_ref_v2_aliases.sql" | awk '{print $1}')" = "$SHA31" || fail "0031 SHA-256 mismatch"
 test "$(shasum -a 384 "$MIGRATIONS/0031_doc_source_ref_v2_aliases.sql" | awk '{print $1}')" = "$SHA384_31" || fail "0031 SHA-384 mismatch"

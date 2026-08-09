@@ -1,7 +1,7 @@
 # 0037 — embedding_ann_projections schema-ledger true-up
 
-**Lane:** kengram-prod-schema-ledger-drift-ann-projections  
-**Owner:** diesel · **Reviewer:** neo · **Money path:** N  
+**Lane:** kengram-prod-schema-ledger-drift-ann-projections
+**Owner:** diesel · **Reviewer:** neo · **Money path:** N
 **Date:** 2026-08-09
 
 ## Finding
@@ -46,3 +46,10 @@
 - Case3 drop role after last DB: **cannot complete on this host** — pre-existing `pg_shdepend` on role from unrelated DB `kengram_narrow` (role correctly retained by multi-DB-safe down). Disposable docker cluster is required for clean case3.
 
 Neo re-run of `./scripts/test-migration-0036-multi-db-down.sh` on a healthy docker host is the bar for official 3/3.
+
+## Repair (Neo CN — 0035 harness + whitespace)
+
+- Reverted naive `assert_exact_1_37` expansion (broke postapply: 35-row ledger vs 37-row FULL_MANIFEST).
+- 0035 suite now builds disposable `migrations-1-35` scope before FULL_MANIFEST / sqlx `--source` / `--target-version 35` comparisons. Later migrations (0036/0037) no longer poison this registered harness.
+- Receipt trailing whitespace stripped (`git diff --check` clean).
+- Multi-db official harness already GREEN 3/3 at prior head (Neo); Studio docker still intermittent-hang for local re-run.
