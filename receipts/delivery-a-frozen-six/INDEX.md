@@ -1,8 +1,8 @@
 # KENGRAM Delivery A — frozen six mutant receipts (diesel ceremony repair)
 
-- executed_code_head: `1b9b5ca9342e97129958bb7cb1df0d4c8e0b3171`
+- executed_code_head: `2410ed722e5184d8699cc78b3a7f82b3deb0fd42`
 - certifier: `diesel`
-- when: `2026-08-09T18:50:38.259730+00:00`
+- when: `2026-08-09T18:52:24.362755+00:00`
 - frozen_spec_section: `10`
 
 Checker: exactly-one-preimage; RED only with capability-after-entry + unique
@@ -101,7 +101,7 @@ GREEN; `RECEIPT_OK` never unconditional.
 
 ## Summary
 
-**ALL_SIX_FROZEN_MUTANT_RECEIPTS_OK** = `True` executed_code_head=`1b9b5ca9342e97129958bb7cb1df0d4c8e0b3171`
+**ALL_SIX_FROZEN_MUTANT_RECEIPTS_OK** = `True` executed_code_head=`2410ed722e5184d8699cc78b3a7f82b3deb0fd42`
 
 Final file hashes after ceremony:
 

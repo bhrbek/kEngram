@@ -1,9 +1,9 @@
 {
   "kind": "kengram-pr20-delivery-a-frozen-six-ceremony",
   "spec_section": "10",
-  "executed_code_head": "1b9b5ca9342e97129958bb7cb1df0d4c8e0b3171",
+  "executed_code_head": "2410ed722e5184d8699cc78b3a7f82b3deb0fd42",
   "certifier": "diesel",
-  "when": "2026-08-09T18:50:38.259730+00:00",
+  "when": "2026-08-09T18:52:24.362755+00:00",
   "transforms": {
     "M1": "DELETE query-embedding recorder call",
     "M2": "FTS timeout to healthy empty",

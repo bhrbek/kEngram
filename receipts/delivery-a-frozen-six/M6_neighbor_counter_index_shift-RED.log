@@ -17,10 +17,10 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 233 filtered out
 
 --- stderr ---
    Compiling kengram-mcp v0.2.0 (/Volumes/devdrive1/worktrees/kengram-diesel-pr20-ceremony-20260809/crates/kengram-mcp)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.59s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.51s
      Running unittests src/lib.rs (target/debug/deps/kengram_mcp-e9571d5513c81bd6)
 
-thread 'degradation::tests::record_increments_exact_cell' (1312851528) panicked at crates/kengram-mcp/src/degradation.rs:404:9:
+thread 'degradation::tests::record_increments_exact_cell' (1312950240) panicked at crates/kengram-mcp/src/degradation.rs:404:9:
 assertion `left == right` failed: KENGRAM_DELIVERY_A_RED:M6_counter_index
   left: 0
  right: 1
