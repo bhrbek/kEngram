@@ -1186,4 +1186,31 @@ mod tests {
         assert_eq!(c.tagger.concurrency, 3);
         assert_eq!(c.tagger.batch_size, Some(8));
     }
+    #[test]
+    fn effective_timeouts_json_includes_all_seven_lexical_and_env_docs() {
+        let mut c = Config::default();
+        c.search.thought_fts_timeout_ms = 111;
+        c.search.chunk_fts_timeout_ms = 222;
+        c.search.contextual_chunk_fts_timeout_ms = 333;
+        c.search.pairwise_chunk_fts_timeout_ms = 444;
+        c.search.domain_scope_timeout_ms = 555;
+        c.search.tag_facet_timeout_ms = 1234;
+        c.search.expansion_fts_timeout_ms = 666;
+        let v = c.search.effective_timeouts_json();
+        assert_eq!(v["thought_fts_timeout_ms"], 111);
+        assert_eq!(v["chunk_fts_timeout_ms"], 222);
+        assert_eq!(v["contextual_chunk_fts_timeout_ms"], 333);
+        assert_eq!(v["pairwise_chunk_fts_timeout_ms"], 444);
+        assert_eq!(v["domain_scope_timeout_ms"], 555);
+        assert_eq!(v["tag_facet_timeout_ms"], 1234);
+        assert_eq!(v["expansion_fts_timeout_ms"], 666);
+        let src = include_str!("config.rs");
+        for env in [
+            "KENGRAM_SEARCH__THOUGHT_FTS_TIMEOUT_MS",
+            "KENGRAM_SEARCH__TAG_FACET_TIMEOUT_MS",
+            "KENGRAM_SEARCH__EXPANSION_FTS_TIMEOUT_MS",
+        ] {
+            assert!(src.contains(env), "missing env doc {env}");
+        }
+    }
 }
