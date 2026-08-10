@@ -10,6 +10,7 @@
 
 pub mod backfill;
 pub mod capture;
+pub mod citation;
 pub mod degradation;
 pub mod drain;
 pub mod filters;

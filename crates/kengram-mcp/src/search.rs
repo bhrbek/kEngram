@@ -2719,6 +2719,7 @@ mod tests {
             trigram_score: None,
             rrf_score: Some(1.0),
             rerank_score: None,
+            age_factor: None,
             chunk: None,
         }
     }
