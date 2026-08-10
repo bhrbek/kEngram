@@ -86,6 +86,11 @@ pub struct Hit {
     /// reranker. `None` when rerank was off, no reranker was configured,
     /// or the hit fell outside the reranked candidate pool.
     pub rerank_score: Option<f32>,
+    /// Source-age decay factor `2^(-age_days / half_life_days)` computed by
+    /// [`source_age_fusion`] over the persisted valid-time clock
+    /// (`thought.created_at`). `None` until that stage runs; `Some(0.0)`
+    /// when the stage ran with the half-life disabled.
+    pub age_factor: Option<f32>,
     /// `Some(_)` when a chunk leg produced the hit. The parent thought stays
     /// in `thought`; this carries the matched chunk evidence.
     pub chunk: Option<ChunkProvenance>,
@@ -103,6 +108,7 @@ impl Hit {
             trigram_score: None,
             rrf_score: None,
             rerank_score: None,
+            age_factor: None,
             chunk: None,
         }
     }
@@ -118,6 +124,7 @@ impl Hit {
             trigram_score: Some(rank),
             rrf_score: None,
             rerank_score: None,
+            age_factor: None,
             chunk: None,
         }
     }
@@ -133,6 +140,7 @@ impl Hit {
             trigram_score: Some(similarity),
             rrf_score: None,
             rerank_score: None,
+            age_factor: None,
             chunk: None,
         }
     }
@@ -184,6 +192,7 @@ pub fn rrf_fuse(rankings: Vec<Vec<Hit>>, k: f32) -> Vec<Hit> {
                         trigram_score: hit.trigram_score,
                         rrf_score: Some(contribution),
                         rerank_score: None,
+                        age_factor: None,
                         chunk: hit.chunk,
                     };
                     acc.insert(id, merged);
@@ -223,6 +232,65 @@ pub fn recency_boost(hits: &mut [Hit], half_life_days: f32, now: OffsetDateTime)
         let bv = b.rrf_score.unwrap_or(0.0);
         bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
     });
+}
+
+/// Post-rerank source-age near-tie fusion (spec r7 T2 / item0 component 3).
+///
+/// Takes hits in their EXISTING order — the successful-rerank order when the
+/// reranker ran, otherwise the fused (RRF + recency) order — and treats the
+/// 1-based position as the rank. For each hit:
+///
+/// ```text
+/// age_factor           = 2^(-age_days / half_life_days)      (valid-time clock)
+/// relevance_component  = 4 / (60 + rank)
+/// source_age_component = age_factor * (2.0 / 1891.0)
+/// final                = relevance_component + source_age_component
+/// ```
+///
+/// `2.0 / 1891.0` is the exact frozen constant: it equals `4/(61*62)`, the
+/// relevance gap between ranks 1 and 2, so a maximally fresh source exactly
+/// bridges one adjacent-rank gap at the top and progressively more below.
+/// Hits are re-sorted by `final` descending (stable: equal finals keep the
+/// incoming order). Runs BEFORE limit truncation so a hit just outside the
+/// requested limit can enter on age. With `half_life_days <= 0.0` the stage
+/// records `age_factor = Some(0.0)` and leaves the order untouched.
+///
+/// T1 supersession is explicitly NOT an input here (Phase-2 substitutes
+/// `effective_rank` at this same site without changing the age term).
+pub fn source_age_fusion(hits: &mut [Hit], half_life_days: f32, ranking_now: OffsetDateTime) {
+    if half_life_days <= 0.0 {
+        for h in hits.iter_mut() {
+            h.age_factor = Some(0.0);
+        }
+        return;
+    }
+
+    let mut keyed: Vec<(usize, f32)> = hits
+        .iter_mut()
+        .enumerate()
+        .map(|(index, hit)| {
+            let rank = (index + 1) as f32;
+            let age_seconds = (ranking_now - hit.thought.created_at).whole_seconds().max(0) as f32;
+            let age_days = age_seconds / 86_400.0;
+            let age_factor = 2.0_f32.powf(-age_days / half_life_days);
+            hit.age_factor = Some(age_factor);
+            let relevance_component = 4.0 / (60.0 + rank);
+            let source_age_component = age_factor * (2.0 / 1891.0);
+            (index, relevance_component + source_age_component)
+        })
+        .collect();
+
+    keyed.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let order: Vec<usize> = keyed.into_iter().map(|(index, _)| index).collect();
+
+    // Apply the permutation in place.
+    let mut reordered: Vec<Hit> = Vec::with_capacity(hits.len());
+    for &index in &order {
+        reordered.push(hits[index].clone());
+    }
+    for (slot, hit) in hits.iter_mut().zip(reordered.into_iter()) {
+        *slot = hit;
+    }
 }
 
 #[cfg(test)]
@@ -367,6 +435,7 @@ mod tests {
             trigram_score: None,
             rrf_score: Some(1.0),
             rerank_score: None,
+            age_factor: None,
             chunk: None,
         }];
         recency_boost(&mut hits, 30.0, now);
@@ -383,6 +452,7 @@ mod tests {
             trigram_score: None,
             rrf_score: Some(1.0),
             rerank_score: None,
+            age_factor: None,
             chunk: None,
         }];
         recency_boost(&mut hits, 30.0, now);
@@ -402,6 +472,7 @@ mod tests {
                 trigram_score: None,
                 rrf_score: Some(0.8),
                 rerank_score: None,
+                age_factor: None,
                 chunk: None,
             },
             Hit {
@@ -411,6 +482,7 @@ mod tests {
                 trigram_score: None,
                 rrf_score: Some(0.5),
                 rerank_score: None,
+                age_factor: None,
                 chunk: None,
             },
         ];
@@ -429,9 +501,87 @@ mod tests {
             trigram_score: None,
             rrf_score: Some(1.0),
             rerank_score: None,
+            age_factor: None,
             chunk: None,
         }];
         recency_boost(&mut hits, 0.0, now);
         assert_eq!(hits[0].rrf_score.unwrap(), 1.0);
+    }
+
+    fn ranked_hit(id_seed: u128, age_seconds: i64, rerank_score: f32) -> Hit {
+        let mut h = Hit::from_vector_leg(thought(id_seed, "x", age_seconds), 0.5);
+        h.rerank_score = Some(rerank_score);
+        h
+    }
+
+    #[test]
+    fn source_age_fusion_flips_adjacent_near_tie_for_fresh_source() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        // The frozen constant 2/1891 EQUALS the rank-1<->2 relevance gap, so
+        // the top pair can tie but never flip on age alone; flips open at
+        // rank >= 2 where gaps shrink (4/((60+r)(61+r)) < 2/1891 for r >= 2).
+        // Plant the near-tie at ranks 2 and 3 under a rank-1 anchor: the
+        // brand-new rank-3 source (age_factor 1) out-bridges the 4/(62*63)
+        // gap and overtakes the stale rank-2 hit; the anchor stays on top.
+        let mut hits = vec![
+            ranked_hit(1, 3650 * 86_400, 0.95),
+            ranked_hit(2, 3650 * 86_400, 0.900_01),
+            ranked_hit(3, 0, 0.900_00),
+        ];
+        source_age_fusion(&mut hits, 30.0, now);
+        assert_eq!(hits[0].thought.id, ThoughtId::from(uuid::Uuid::from_u128(1)));
+        assert_eq!(hits[1].thought.id, ThoughtId::from(uuid::Uuid::from_u128(3)));
+        assert_eq!(hits[2].thought.id, ThoughtId::from(uuid::Uuid::from_u128(2)));
+        assert!(hits[1].age_factor.unwrap() > 0.999);
+        assert!(hits[2].age_factor.unwrap() < 0.001);
+    }
+
+    #[test]
+    fn source_age_fusion_top_pair_ties_but_never_flips_on_age_alone() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        // Constant-engineering pin: a maximally fresh rank-2 source exactly
+        // bridges the rank-1 gap (4/61 == 4/62 + 2/1891) and the stable sort
+        // keeps the incumbent first. If the frozen constant drifts upward
+        // this test catches the top-pair flip becoming possible.
+        let mut hits = vec![
+            ranked_hit(1, 3650 * 86_400, 0.900_01),
+            ranked_hit(2, 0, 0.900_00),
+        ];
+        source_age_fusion(&mut hits, 30.0, now);
+        assert_eq!(hits[0].thought.id, ThoughtId::from(uuid::Uuid::from_u128(1)));
+    }
+
+    #[test]
+    fn source_age_fusion_same_age_preserves_rank_order() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let mut hits = vec![ranked_hit(1, 100, 0.9), ranked_hit(2, 100, 0.8)];
+        source_age_fusion(&mut hits, 30.0, now);
+        assert_eq!(hits[0].thought.id, ThoughtId::from(uuid::Uuid::from_u128(1)));
+    }
+
+    #[test]
+    fn source_age_fusion_disabled_half_life_records_zero_and_keeps_order() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let mut hits = vec![ranked_hit(1, 3650 * 86_400, 0.5), ranked_hit(2, 0, 0.9)];
+        source_age_fusion(&mut hits, 0.0, now);
+        assert_eq!(hits[0].thought.id, ThoughtId::from(uuid::Uuid::from_u128(1)));
+        assert_eq!(hits[0].age_factor, Some(0.0));
+        assert_eq!(hits[1].age_factor, Some(0.0));
+    }
+
+    #[test]
+    fn source_age_fusion_promotes_from_outside_limit_boundary() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        // Three hits; caller will take(2) AFTER fusion. The fresh rank-3 hit
+        // gains 2/1891 while ranks 2 and 3 differ by 4/62 - 4/63 < 2/1891,
+        // so it enters the top 2 purely on the age term.
+        let mut hits = vec![
+            ranked_hit(1, 3650 * 86_400, 0.93),
+            ranked_hit(2, 3650 * 86_400, 0.92),
+            ranked_hit(3, 0, 0.91),
+        ];
+        source_age_fusion(&mut hits, 30.0, now);
+        let top2: Vec<_> = hits.iter().take(2).map(|h| h.thought.id).collect();
+        assert!(top2.contains(&ThoughtId::from(uuid::Uuid::from_u128(3))));
     }
 }
