@@ -64,17 +64,22 @@ struct WriteSurface {
 }
 
 async fn write_surface(pool: &PgPool, namespace: &str, source_ref: &str) -> WriteSurface {
-    let (thoughts, source_events, gate_events, links, pending_embeddings): (i64, i64, i64, i64, i64) =
-        sqlx::query_as(
-            "SELECT (SELECT COUNT(*) FROM thoughts),
+    let (thoughts, source_events, gate_events, links, pending_embeddings): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM thoughts),
                     (SELECT COUNT(*) FROM argus_source_events),
                     (SELECT COUNT(*) FROM thought_ingest_gate_events),
                     (SELECT COUNT(*) FROM thought_links),
                     (SELECT COUNT(*) FROM pending_embeddings)",
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap();
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
     let last_seen_at: Option<OffsetDateTime> = sqlx::query_scalar(
         "SELECT last_seen_at FROM argus_source_events WHERE namespace = $1 AND source_ref = $2",
     )
@@ -97,8 +102,12 @@ async fn write_surface(pool: &PgPool, namespace: &str, source_ref: &str) -> Writ
 #[sqlx::test(migrations = "../../migrations")]
 async fn a2_resolved_origin_ids_first_occurrence_distinct_order(pool: PgPool) {
     let scope = "agents/item0-a2";
-    let o1 = cap(&pool, scope, "origin one".into(), None, None).await.unwrap();
-    let o2 = cap(&pool, scope, "origin two".into(), None, None).await.unwrap();
+    let o1 = cap(&pool, scope, "origin one".into(), None, None)
+        .await
+        .unwrap();
+    let o2 = cap(&pool, scope, "origin two".into(), None, None)
+        .await
+        .unwrap();
     // Name them so uuid(a) < uuid(b) regardless of which capture got which id.
     let (a, b) = if o1.thought_id.into_uuid() < o2.thought_id.into_uuid() {
         (o1.thought_id, o2.thought_id)
@@ -126,11 +135,21 @@ async fn a2_resolved_origin_ids_first_occurrence_distinct_order(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn b_origin_validation_fails_closed_with_named_errors(pool: PgPool) {
     let scope = "agents/item0-b";
-    let origin = cap(&pool, scope, "live origin".into(), None, None).await.unwrap();
-    let other_scope_origin = cap(&pool, "agents/item0-b-other", "other-scope origin".into(), None, None)
+    let origin = cap(&pool, scope, "live origin".into(), None, None)
         .await
         .unwrap();
-    let retracted_origin = cap(&pool, scope, "doomed origin".into(), None, None).await.unwrap();
+    let other_scope_origin = cap(
+        &pool,
+        "agents/item0-b-other",
+        "other-scope origin".into(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let retracted_origin = cap(&pool, scope, "doomed origin".into(), None, None)
+        .await
+        .unwrap();
     retract_thought(
         &pool,
         RetractThoughtRequest {
@@ -146,9 +165,15 @@ async fn b_origin_validation_fails_closed_with_named_errors(pool: PgPool) {
         .unwrap();
 
     let unknown = ThoughtId::from(uuid::Uuid::from_u128(0xdead_beef_dead_beef_dead_beef_u128));
-    let err = cap(&pool, scope, format!("x {}", format_citation(unknown)), None, None)
-        .await
-        .unwrap_err();
+    let err = cap(
+        &pool,
+        scope,
+        format!("x {}", format_citation(unknown)),
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(err, CaptureError::CitationOriginNotFound(id) if id == unknown),
         "unknown origin must reject with CitationOriginNotFound, got: {err}"
@@ -187,7 +212,10 @@ async fn b_origin_validation_fails_closed_with_named_errors(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(thoughts_before, thoughts_after, "rejected captures must write no thought");
+    assert_eq!(
+        thoughts_before, thoughts_after,
+        "rejected captures must write no thought"
+    );
     let _ = origin;
 }
 
@@ -248,9 +276,18 @@ async fn b2_completed_replay_precedes_origin_liveness_with_zero_writes(pool: PgP
     .unwrap();
     let after = write_surface(&pool, ns, sref).await;
 
-    assert_eq!(replay.thought_id, first.thought_id, "replay must return the original thought");
-    assert_eq!(replay.born_on, first.born_on, "replay must return the original born_on");
-    assert!(replay.is_duplicate, "replay is a duplicate disposition, not a new row");
+    assert_eq!(
+        replay.thought_id, first.thought_id,
+        "replay must return the original thought"
+    );
+    assert_eq!(
+        replay.born_on, first.born_on,
+        "replay must return the original born_on"
+    );
+    assert!(
+        replay.is_duplicate,
+        "replay is a duplicate disposition, not a new row"
+    );
     assert_eq!(
         before, after,
         "completed replay must be read-only: no count and no last_seen_at change"
@@ -286,7 +323,10 @@ async fn b2_completed_replay_precedes_origin_liveness_with_zero_writes(pool: PgP
     .await
     .unwrap();
     assert_eq!(new_identity_rows, 0);
-    assert_eq!(before_neg, after_neg, "rejected new identity must write nothing");
+    assert_eq!(
+        before_neg, after_neg,
+        "rejected new identity must write nothing"
+    );
 }
 
 // (c) inheritance: gate-row effective_created_at equals the fold minimum —
@@ -296,7 +336,9 @@ async fn c_gate_row_effective_created_at_is_fold_minimum(pool: PgPool) {
     let scope = "agents/item0-c";
     let old = OffsetDateTime::from_unix_timestamp(1_650_000_000).unwrap();
     let newer = old + time::Duration::days(30);
-    let origin = cap(&pool, scope, "old origin".into(), Some(old), None).await.unwrap();
+    let origin = cap(&pool, scope, "old origin".into(), Some(old), None)
+        .await
+        .unwrap();
     let resp = cap(
         &pool,
         scope,
@@ -307,7 +349,9 @@ async fn c_gate_row_effective_created_at_is_fold_minimum(pool: PgPool) {
     .await
     .unwrap();
 
-    let gate_event_id = resp.gate_event_id.expect("gated capture must return its gate event id");
+    let gate_event_id = resp
+        .gate_event_id
+        .expect("gated capture must return its gate event id");
     let effective: OffsetDateTime = sqlx::query_scalar(
         "SELECT effective_created_at FROM thought_ingest_gate_events WHERE id = $1",
     )

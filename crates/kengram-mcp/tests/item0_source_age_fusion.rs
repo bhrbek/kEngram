@@ -127,7 +127,11 @@ async fn e1_rerank_arm_adjacent_near_tie_flips_for_fresh_source(pool: PgPool) {
     let fresh_pair = plant(&pool, "fusionprobe pair-fresh brand new source", 0).await;
 
     let reranker = ScriptedReranker {
-        rules: vec![("anchor", 0.95), ("pair-old", 0.900_01), ("pair-fresh", 0.900_00)],
+        rules: vec![
+            ("anchor", 0.95),
+            ("pair-old", 0.900_01),
+            ("pair-fresh", 0.900_00),
+        ],
     };
     let embedder = FakeEmbedder::new();
     let resp = search_thoughts(&pool, &embedder, Some(&reranker), request(10, true))
@@ -136,20 +140,31 @@ async fn e1_rerank_arm_adjacent_near_tie_flips_for_fresh_source(pool: PgPool) {
     assert!(resp.rerank_used, "e1 requires the successful-rerank arm");
     let order: Vec<_> = resp.results.iter().map(|h| h.thought_id).collect();
     assert_eq!(order.len(), 3);
-    assert!(resp.results[0].content.contains("anchor"), "rank-1 anchor holds (gap == max age term)");
+    assert!(
+        resp.results[0].content.contains("anchor"),
+        "rank-1 anchor holds (gap == max age term)"
+    );
     assert_eq!(
         order[1], fresh_pair,
         "fresh source must flip above the old near-tie at ranks 2/3"
     );
     assert_eq!(order[2], old_pair);
-    let fresh_af = resp.results[1].age_factor.expect("age_factor must be set by fusion");
-    let old_af = resp.results[2].age_factor.expect("age_factor must be set by fusion");
+    let fresh_af = resp.results[1]
+        .age_factor
+        .expect("age_factor must be set by fusion");
+    let old_af = resp.results[2]
+        .age_factor
+        .expect("age_factor must be set by fusion");
     assert!(fresh_af > 0.99, "fresh age_factor ~ 1, got {fresh_af}");
     assert!(old_af < 0.001, "ten-year age_factor ~ 0, got {old_af}");
 }
 
 /// Plant with sub-day precision (the e2 window is hours wide).
-async fn plant_at_minutes(pool: &PgPool, content: &str, age_minutes: i64) -> kengram_core::ThoughtId {
+async fn plant_at_minutes(
+    pool: &PgPool,
+    content: &str,
+    age_minutes: i64,
+) -> kengram_core::ThoughtId {
     let resp = capture_with_gate_options(
         pool,
         EMBEDDER,
@@ -203,7 +218,10 @@ async fn e2_fallback_arm_applies_same_term_to_fused_order(pool: PgPool) {
     let resp = search_thoughts(&pool, &embedder, None, request(50, false))
         .await
         .unwrap();
-    assert!(!resp.rerank_used, "e2 requires the reranker-off/fallback arm");
+    assert!(
+        !resp.rerank_used,
+        "e2 requires the reranker-off/fallback arm"
+    );
     assert_eq!(resp.results.len(), 42, "all planted rows must return");
 
     // OBSERVED pre-item0 fallback order: rrf_score is the recency-boosted RRF
@@ -212,7 +230,12 @@ async fn e2_fallback_arm_applies_same_term_to_fused_order(pool: PgPool) {
     let mut pre_order: Vec<_> = resp
         .results
         .iter()
-        .map(|h| (h.thought_id, h.rrf_score.expect("fused fallback hits carry rrf_score")))
+        .map(|h| {
+            (
+                h.thought_id,
+                h.rrf_score.expect("fused fallback hits carry rrf_score"),
+            )
+        })
         .collect();
     pre_order.sort_by(|a, b| b.1.total_cmp(&a.1));
     let pre_ids: Vec<_> = pre_order.iter().map(|(id, _)| *id).collect();
@@ -245,7 +268,10 @@ async fn e2_fallback_arm_applies_same_term_to_fused_order(pool: PgPool) {
         .collect();
     let old_af = by_id[&old].expect("age_factor populated on the fallback path");
     let fresh_af = by_id[&fresh].expect("age_factor populated on the fallback path");
-    assert!((0.55..0.65).contains(&old_af), "old decay ~0.60, got {old_af}");
+    assert!(
+        (0.55..0.65).contains(&old_af),
+        "old decay ~0.60, got {old_af}"
+    );
     assert!(fresh_af > 0.99, "fresh decay ~1, got {fresh_af}");
 }
 
@@ -258,7 +284,11 @@ async fn e3_fresh_candidate_enters_from_outside_the_limit(pool: PgPool) {
     let fresh_pair = plant(&pool, "fusionprobe pair-fresh brand new source", 0).await;
 
     let reranker = ScriptedReranker {
-        rules: vec![("anchor", 0.95), ("pair-old", 0.900_01), ("pair-fresh", 0.900_00)],
+        rules: vec![
+            ("anchor", 0.95),
+            ("pair-old", 0.900_01),
+            ("pair-fresh", 0.900_00),
+        ],
     };
     let embedder = FakeEmbedder::new();
     // limit=2: pre-fusion the fresh candidate sits at rank 3, OUTSIDE the

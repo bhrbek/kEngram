@@ -270,7 +270,9 @@ pub fn source_age_fusion(hits: &mut [Hit], half_life_days: f32, ranking_now: Off
         .enumerate()
         .map(|(index, hit)| {
             let rank = (index + 1) as f32;
-            let age_seconds = (ranking_now - hit.thought.created_at).whole_seconds().max(0) as f32;
+            let age_seconds = (ranking_now - hit.thought.created_at)
+                .whole_seconds()
+                .max(0) as f32;
             let age_days = age_seconds / 86_400.0;
             let age_factor = 2.0_f32.powf(-age_days / half_life_days);
             hit.age_factor = Some(age_factor);
@@ -529,9 +531,18 @@ mod tests {
             ranked_hit(3, 0, 0.900_00),
         ];
         source_age_fusion(&mut hits, 30.0, now);
-        assert_eq!(hits[0].thought.id, ThoughtId::from(uuid::Uuid::from_u128(1)));
-        assert_eq!(hits[1].thought.id, ThoughtId::from(uuid::Uuid::from_u128(3)));
-        assert_eq!(hits[2].thought.id, ThoughtId::from(uuid::Uuid::from_u128(2)));
+        assert_eq!(
+            hits[0].thought.id,
+            ThoughtId::from(uuid::Uuid::from_u128(1))
+        );
+        assert_eq!(
+            hits[1].thought.id,
+            ThoughtId::from(uuid::Uuid::from_u128(3))
+        );
+        assert_eq!(
+            hits[2].thought.id,
+            ThoughtId::from(uuid::Uuid::from_u128(2))
+        );
         assert!(hits[1].age_factor.unwrap() > 0.999);
         assert!(hits[2].age_factor.unwrap() < 0.001);
     }
@@ -548,7 +559,10 @@ mod tests {
             ranked_hit(2, 0, 0.900_00),
         ];
         source_age_fusion(&mut hits, 30.0, now);
-        assert_eq!(hits[0].thought.id, ThoughtId::from(uuid::Uuid::from_u128(1)));
+        assert_eq!(
+            hits[0].thought.id,
+            ThoughtId::from(uuid::Uuid::from_u128(1))
+        );
     }
 
     #[test]
@@ -556,7 +570,10 @@ mod tests {
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let mut hits = vec![ranked_hit(1, 100, 0.9), ranked_hit(2, 100, 0.8)];
         source_age_fusion(&mut hits, 30.0, now);
-        assert_eq!(hits[0].thought.id, ThoughtId::from(uuid::Uuid::from_u128(1)));
+        assert_eq!(
+            hits[0].thought.id,
+            ThoughtId::from(uuid::Uuid::from_u128(1))
+        );
     }
 
     #[test]
@@ -564,7 +581,10 @@ mod tests {
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let mut hits = vec![ranked_hit(1, 3650 * 86_400, 0.5), ranked_hit(2, 0, 0.9)];
         source_age_fusion(&mut hits, 0.0, now);
-        assert_eq!(hits[0].thought.id, ThoughtId::from(uuid::Uuid::from_u128(1)));
+        assert_eq!(
+            hits[0].thought.id,
+            ThoughtId::from(uuid::Uuid::from_u128(1))
+        );
         assert_eq!(hits[0].age_factor, Some(0.0));
         assert_eq!(hits[1].age_factor, Some(0.0));
     }
