@@ -219,6 +219,11 @@ pub struct SearchHit {
     /// Calibrated absolute score from the reranker (`None` if rerank was
     /// off, unavailable, or this hit fell outside the candidate pool).
     pub rerank_score: Option<f32>,
+    /// Source-age decay factor `2^(-age_days / half_life_days)` from the
+    /// post-rerank source-age fusion stage (item0). Computed over the
+    /// persisted valid-time clock (`created_at`); `Some(0.0)` when the
+    /// half-life is disabled.
+    pub age_factor: Option<f32>,
     /// Matched chunk provenance when a chunk leg supplied evidence for this
     /// parent thought hit. `content` above remains the parent thought body for
     /// backward compatibility.
@@ -1103,6 +1108,13 @@ async fn search_thoughts_with_tuning(
     };
     profile.rerank_ms = elapsed_ms(rerank_started);
 
+    // item0: post-rerank source-age near-tie fusion (spec r7 T2). Applied to
+    // the EXISTING order of `fused` — the successful-rerank order when the
+    // reranker ran, otherwise the fused RRF+recency order — and BEFORE the
+    // `take(limit)` truncation so a hit just outside the limit can enter on
+    // source age. Never part of reranker input text.
+    kengram_core::search::source_age_fusion(&mut fused, half_life, OffsetDateTime::now_utc());
+
     let projection_started = Instant::now();
     let results: Vec<SearchHit> = fused
         .into_iter()
@@ -1570,6 +1582,7 @@ async fn collect_graph_expansion(
                 trigram_score: None,
                 rrf_score: None,
                 rerank_score: None,
+                age_factor: None,
                 chunk: None,
             }
         });
@@ -1643,6 +1656,7 @@ fn search_hit_from_core_hit(
         trigram_score: h.trigram_score,
         rrf_score: h.rrf_score,
         rerank_score: h.rerank_score,
+        age_factor: h.age_factor,
         chunk_id: chunk.as_ref().map(|c| c.chunk_id),
         chunk_artifact_id: chunk.as_ref().map(|c| c.artifact_id),
         chunk_source_thought_id: chunk.as_ref().map(|c| c.source_thought_id),
@@ -2705,6 +2719,7 @@ mod tests {
             trigram_score: None,
             rrf_score: Some(1.0),
             rerank_score: None,
+            age_factor: None,
             chunk: None,
         }
     }

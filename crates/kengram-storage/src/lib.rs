@@ -653,6 +653,29 @@ pub enum StorageError {
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 
+    #[error(
+        "source_created_at_too_far_in_future: source_created_at={source_created_at} observed_at={observed_at}"
+    )]
+    SourceCreatedAtTooFarInFuture {
+        source_created_at: OffsetDateTime,
+        observed_at: OffsetDateTime,
+    },
+
+    #[error("citation origin not found: {0}")]
+    CitationOriginNotFound(Uuid),
+
+    #[error(
+        "citation origin scope mismatch: thought_id={thought_id} expected_scope={expected_scope} actual_scope={actual_scope}"
+    )]
+    CitationOriginScopeMismatch {
+        thought_id: Uuid,
+        expected_scope: String,
+        actual_scope: String,
+    },
+
+    #[error("citation origin is retracted: {0}")]
+    CitationOriginRetracted(Uuid),
+
     #[error("invalid scope decoded from database: {0}")]
     InvalidScope(#[from] ScopeError),
 
@@ -802,7 +825,8 @@ pub async fn insert_thought(
             content: t.content,
             source: t.source.as_str(),
             metadata: t.metadata.as_value(),
-            source_created_at: Some(OffsetDateTime::now_utc()),
+            raw_source_created_at: None,
+            citation_origin_ids: &[],
             candidate_embedding: None,
             embedding_model_id: None,
             embedding_model_version: None,

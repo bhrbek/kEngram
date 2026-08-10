@@ -46,6 +46,19 @@ cargo test -p kengram-mcp --lib link::tests::payload_hash_rejects_uuid_with_hyph
 cargo test -p kengram-mcp --lib link::tests::payload_hash_accepts_64_lowercase_hex -- --exact --test-threads=1
 cargo test -p kengram-mcp --lib link::tests::payload_hash_rejects_63_lowercase_hex -- --exact --test-threads=1
 cargo test -p kengram-mcp --lib link::tests::payload_hash_rejects_65_lowercase_hex -- --exact --test-threads=1
+
+# item0 (spec a5f639da): citation grammar unit + watched integration tests
+cargo test -p kengram-mcp --lib citation -- --test-threads=1
+cargo test -p kengram-mcp --test item0_citation_capture -- --test-threads=1
+cargo test -p kengram-mcp --test item0_source_age_fusion -- --test-threads=1
+cargo test -p kengram-mcp --test item0_citation_capture a2_resolved_origin_ids_first_occurrence_distinct_order -- --exact --test-threads=1
+cargo test -p kengram-mcp --test item0_citation_capture b_origin_validation_fails_closed_with_named_errors -- --exact --test-threads=1
+cargo test -p kengram-mcp --test item0_citation_capture b2_completed_replay_precedes_origin_liveness_with_zero_writes -- --exact --test-threads=1
+cargo test -p kengram-mcp --test item0_citation_capture c_gate_row_effective_created_at_is_fold_minimum -- --exact --test-threads=1
+cargo test -p kengram-mcp --test item0_citation_capture d_wire_names_round_trip_persisted_created_at -- --exact --test-threads=1
+cargo test -p kengram-mcp --test item0_source_age_fusion e1_rerank_arm_adjacent_near_tie_flips_for_fresh_source -- --exact --test-threads=1
+cargo test -p kengram-mcp --test item0_source_age_fusion e2_fallback_arm_applies_same_term_to_fused_order -- --exact --test-threads=1
+cargo test -p kengram-mcp --test item0_source_age_fusion e3_fresh_candidate_enters_from_outside_the_limit -- --exact --test-threads=1
 cargo test -p kengram-mcp --lib link::tests::payload_hash_rejects_63_a_plus_g -- --exact --test-threads=1
 cargo test -p kengram-mcp --lib link::tests::link_thoughts_rejects_nonhex_payload_hash -- --exact --test-threads=1
 cargo test -p kengram-mcp --lib link::tests::unlink_thoughts_rejects_nonhex_payload_hash -- --exact --test-threads=1

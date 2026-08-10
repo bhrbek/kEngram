@@ -522,7 +522,7 @@ impl std::fmt::Debug for KengramServer {
 #[tool_router]
 impl KengramServer {
     #[tool(
-        description = "Capture a thought into kengram's persistent memory. Returns the thought_id and embedding_status='pending' after the durable gated insert (embedding is async on the worker; the capture deadline bounds insert only, never embed). The thought is findable by FTS lexical search immediately; vector search picks it up on the next worker tick (default 5 seconds). Identical content (SHA-256 of the bytes) is deduplicated — the response will include `is_duplicate: true` and the pre-existing thought_id when the fingerprint collides. To express that this thought refines, replaces, references, supports, depends on, belongs under, or was decided by another thought, use `link_thoughts` after capture — these relations are queryable via `get_related_thoughts`. Do NOT encode cross-thought relationships in the `metadata` field; metadata is opaque to retrieval and graph traversal. To make a term filterable as an entity or topic, put it in the opening sentence — the tagger lifts phrases from prose surface vocabulary, with extraction probability falling off after the opening."
+        description = "Capture a thought into kengram's persistent memory. A recalled thought citation has exact form `[kg:full-lowercase-UUID]`; valid same-scope live citations are stripped before identity/enrichment and conservatively propagate the oldest source age. Use `[[kg:UUID]]` for literal citation text. Returns thought_id, stable citation, born_on, source-age outcome, and embedding_status='pending' after the durable gated insert (embedding is async on the worker; the capture deadline bounds insert only, never embed). The thought is findable by FTS lexical search immediately; vector search picks it up on the next worker tick (default 5 seconds). Identical content (SHA-256 of the bytes) is deduplicated — the response will include `is_duplicate: true` and the pre-existing thought_id when the fingerprint collides. To express that this thought refines, replaces, references, supports, depends on, belongs under, or was decided by another thought, use `link_thoughts` after capture — these relations are queryable via `get_related_thoughts`. Do NOT encode cross-thought relationships in the `metadata` field; metadata is opaque to retrieval and graph traversal. To make a term filterable as an entity or topic, put it in the opening sentence — the tagger lifts phrases from prose surface vocabulary, with extraction probability falling off after the opening."
     )]
     async fn capture(&self, Parameters(args): Parameters<CaptureArgs>) -> Result<String, String> {
         let capture_deadline = Instant::now() + CAPTURE_TOTAL_TIMEOUT;
@@ -594,7 +594,12 @@ impl KengramServer {
             "detail": "capture returns after durable gated insert; embedding is async via pending_embeddings"
         }));
 
-        let content_for_probe = args.content.clone();
+        // Recovery must bind the exact bytes the gate fingerprints, never the
+        // raw request containing stripped citation directives.
+        let prepared_for_probe = crate::citation::prepare_content(&args.content)
+            .map_err(|error| map_capture_error(CaptureError::Citation(error)))?;
+        let content_for_probe = prepared_for_probe.stripped_content;
+        let resolved_origins_for_probe = prepared_for_probe.distinct_origin_ids;
         // Server-minted per-call identity for gate ledger + deadline recovery
         // (jones 509399). Caller correlation_id is reusable and must NOT alone
         // prove this attempt succeeded; keep it in metadata for forensics.
@@ -684,6 +689,7 @@ impl KengramServer {
                         &content_for_probe,
                         argus_for_probe.as_ref(),
                         correlation_for_probe.as_deref(),
+                        &resolved_origins_for_probe,
                     ),
                 )
                 .await;
@@ -731,11 +737,17 @@ impl KengramServer {
 
         let body = serde_json::json!({
             "thought_id": resp.thought_id.to_string(),
+            "born_on": resp.born_on.format(&Rfc3339).unwrap_or_default(),
+            "citation": resp.citation,
             "embedding_status": resp.embedding_status,
             "is_duplicate": resp.is_duplicate,
             "dedup_kind": resp.dedup_kind,
             "matched_thought_id": resp.matched_thought_id.map(|id| id.to_string()),
             "similarity": resp.similarity,
+            "resolved_origin_ids": resp.resolved_origin_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "derived_source_age": resp.derived_source_age.format(&Rfc3339).unwrap_or_default(),
+            "persisted_source_age": resp.persisted_source_age.format(&Rfc3339).unwrap_or_default(),
+            "source_age_outcome": resp.source_age_outcome,
             "relation_results": resp.relation_results,
             "gate_event_id": resp.gate_event_id,
             "argus_source_event": resp.argus_source_event.map(|event| {
@@ -1091,6 +1103,28 @@ fn map_capture_error(err: CaptureError) -> String {
         CaptureError::ContentTooLong { got, max } => {
             format!("content too long: {got} bytes (max {max} = {MAX_CONTENT_LEN})")
         }
+        CaptureError::Citation(error) => format!("invalid citation: {error}"),
+        CaptureError::CitationOriginNotFound(id) => {
+            format!("citation origin not found: {id}")
+        }
+        CaptureError::CitationOriginScopeMismatch {
+            thought_id,
+            expected_scope,
+            actual_scope,
+        } => format!(
+            "citation origin scope mismatch: thought_id={thought_id} expected_scope={expected_scope} actual_scope={actual_scope}"
+        ),
+        CaptureError::CitationOriginRetracted(id) => {
+            format!("citation origin is retracted: {id}")
+        }
+        CaptureError::SourceCreatedAtTooFarInFuture {
+            source_created_at,
+            observed_at,
+        } => format!(
+            "source_created_at_too_far_in_future: source_created_at={} observed_at={}",
+            source_created_at.format(&Rfc3339).unwrap_or_default(),
+            observed_at.format(&Rfc3339).unwrap_or_default(),
+        ),
         CaptureError::InvalidArgusSourceEvent(reason) => {
             format!("invalid argus_source_event: {reason}")
         }
@@ -1264,6 +1298,7 @@ fn search_response_json(
                 "trigram_score": h.trigram_score,
                 "rrf_score": h.rrf_score,
                 "rerank_score": h.rerank_score,
+                "age_factor": h.age_factor,
             });
             if include_chunk_provenance || h.chunk_id.is_some() {
                 let obj = hit
@@ -1704,6 +1739,7 @@ mod tests {
             trigram_score: None,
             rrf_score: Some(0.5),
             rerank_score: None,
+            age_factor: None,
             chunk_id: None,
             chunk_artifact_id: None,
             chunk_source_thought_id: None,
