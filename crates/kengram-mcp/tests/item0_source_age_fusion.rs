@@ -3,11 +3,18 @@
 //! e1: successful-rerank arm — a planted adjacent-rank near-tie pair (older
 //!     source vs fresh, rerank scores 0.90001 vs 0.90000) flips by exactly the
 //!     source-age component.
-//! e2: reranker-off/fallback arm — the SAME single fusion call site runs on
-//!     the fused (RRF+recency) order; proven by executed age_factor values and
-//!     fusion-consistent response order on a `rerank_used == false` response.
-//!     (The flip parity with e1 rides the shared call site: one
-//!     `source_age_fusion` invocation covers both branches by construction.)
+//! e2: reranker-off/fallback arm (repaired per neo review 29311d17 F1) — a
+//!     controlled planted pair whose OBSERVED pre-item0 fallback order (the
+//!     preserved `rrf_score` field is the recency-boosted RRF sort key the
+//!     fallback path orders by) is old-before-fresh, and whose response order
+//!     is fresh-before-old. The flip window is engineered: 40 fresh fillers
+//!     push the pair to deep ranks where the adjacent relevance gap
+//!     4/((60+r)(61+r)) is smaller than the age term; the old member's age
+//!     (22d ≈ decay 0.601) sits inside the (0.598, 0.604) window where
+//!     recency leaves it ABOVE fresh pre-fusion while the age gap still
+//!     bridges the deep-rank gap. The zero-age-effect mutant
+//!     (source_age_component = age_factor * 0.0) turns THIS selector RED —
+//!     the watched negative control neo's F1 requires.
 //! e3: pre-limit arm — the fresh adjacent candidate starts just OUTSIDE the
 //!     requested `limit` and enters the result set only because the fusion
 //!     runs before truncation.
@@ -141,30 +148,105 @@ async fn e1_rerank_arm_adjacent_near_tie_flips_for_fresh_source(pool: PgPool) {
     assert!(old_af < 0.001, "ten-year age_factor ~ 0, got {old_af}");
 }
 
-// (e2) fallback arm: same term executes on the fused (RRF+recency) order.
+/// Plant with sub-day precision (the e2 window is hours wide).
+async fn plant_at_minutes(pool: &PgPool, content: &str, age_minutes: i64) -> kengram_core::ThoughtId {
+    let resp = capture_with_gate_options(
+        pool,
+        EMBEDDER,
+        None,
+        CaptureRequest {
+            content: content.to_string(),
+            source: Source::new("item0-fusion-test").unwrap(),
+            scope: Some(Scope::new(SCOPE).unwrap()),
+            metadata: None,
+            argus_source_event: None,
+        },
+        CaptureGateOptions::default(),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE thoughts SET created_at = now() - make_interval(mins => $1) WHERE id = $2")
+        .bind(age_minutes as i32)
+        .bind(resp.thought_id.into_uuid())
+        .execute(pool)
+        .await
+        .unwrap();
+    resp.thought_id
+}
+
+// (e2) fallback arm: the same planted pair flips on the fallback path, with
+// the pre-item0 order OBSERVED old-before-fresh (neo F1 repair condition).
 #[sqlx::test(migrations = "../../migrations")]
 async fn e2_fallback_arm_applies_same_term_to_fused_order(pool: PgPool) {
-    let old = plant(&pool, "fusionprobe fallback old source", 3650).await;
-    let fresh = plant(&pool, "fusionprobe fallback fresh source", 0).await;
+    // 40 fresh fillers (2x query term) occupy the top ranks; the pair sits
+    // below them all: old (3x term -> strongest FTS, recency-decayed by
+    // 0.601 to JUST above fresh) and fresh (1x term -> weakest FTS).
+    for i in 0..40 {
+        plant_at_minutes(
+            &pool,
+            &format!("fusionprobe filler fusionprobe number {i}"),
+            0,
+        )
+        .await;
+    }
+    // 22 days 59 minutes: decay 2^(-22.04/30) ~ 0.6014, inside the
+    // (0.5980, 0.6040) window where m/61 lands between 1/102 and 1/101.
+    let old = plant_at_minutes(
+        &pool,
+        "fusionprobe old fusionprobe pair fusionprobe source",
+        22 * 24 * 60 + 59,
+    )
+    .await;
+    let fresh = plant_at_minutes(&pool, "fusionprobe fresh pair source", 0).await;
 
     let embedder = FakeEmbedder::new();
-    let resp = search_thoughts(&pool, &embedder, None, request(10, false))
+    let resp = search_thoughts(&pool, &embedder, None, request(50, false))
         .await
         .unwrap();
     assert!(!resp.rerank_used, "e2 requires the reranker-off/fallback arm");
+    assert_eq!(resp.results.len(), 42, "all planted rows must return");
+
+    // OBSERVED pre-item0 fallback order: rrf_score is the recency-boosted RRF
+    // key the fallback path sorted by before the fusion ran. The pair must be
+    // the bottom two of that order with OLD ABOVE FRESH.
+    let mut pre_order: Vec<_> = resp
+        .results
+        .iter()
+        .map(|h| (h.thought_id, h.rrf_score.expect("fused fallback hits carry rrf_score")))
+        .collect();
+    pre_order.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let pre_ids: Vec<_> = pre_order.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        &pre_ids[40..],
+        &[old, fresh],
+        "pre-item0 fallback order must be ... old, fresh (old ABOVE fresh, both below fillers)"
+    );
+
+    // POST-item0 response order: the fusion flips the pair — fresh overtakes
+    // old across the deep-rank gap on the age term alone.
+    let post_ids: Vec<_> = resp.results.iter().map(|h| h.thought_id).collect();
+    let old_pos = post_ids.iter().position(|id| *id == old).unwrap();
+    let fresh_pos = post_ids.iter().position(|id| *id == fresh).unwrap();
+    assert!(
+        fresh_pos < old_pos,
+        "post-item0 the fresh pair member must rank above old (fresh_pos={fresh_pos}, old_pos={old_pos}) — \
+         this is the assertion the zero-age-effect mutant must turn RED"
+    );
+    // Fresh must NOT have leapfrogged the filler block — the flip is the
+    // adjacent-pair effect, not a wholesale reorder.
+    assert_eq!(fresh_pos, 40, "fresh enters exactly one rank above old");
+    assert_eq!(old_pos, 41);
+
+    // The term ran with the planted decay values.
     let by_id: std::collections::HashMap<_, _> = resp
         .results
         .iter()
         .map(|h| (h.thought_id, h.age_factor))
         .collect();
-    let fresh_af = by_id[&fresh].expect("fallback hits must carry age_factor — the term ran");
-    let old_af = by_id[&old].expect("fallback hits must carry age_factor — the term ran");
-    assert!(fresh_af > 0.99, "fresh age_factor ~ 1 on the fallback path, got {fresh_af}");
-    assert!(old_af < 0.001, "old age_factor ~ 0 on the fallback path, got {old_af}");
-    // Fusion-consistent final order: rank-derived relevance plus the age term
-    // keeps the recency-favored fresh hit first; the old hit cannot outrank it
-    // (its age term is zero and rank relevance is monotone).
-    assert_eq!(resp.results[0].thought_id, fresh);
+    let old_af = by_id[&old].expect("age_factor populated on the fallback path");
+    let fresh_af = by_id[&fresh].expect("age_factor populated on the fallback path");
+    assert!((0.55..0.65).contains(&old_af), "old decay ~0.60, got {old_af}");
+    assert!(fresh_af > 0.99, "fresh decay ~1, got {fresh_af}");
 }
 
 // (e3) pre-limit arm: fresh candidate outside the requested limit enters ONLY
