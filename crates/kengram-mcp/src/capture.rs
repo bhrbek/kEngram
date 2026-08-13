@@ -501,10 +501,20 @@ pub async fn capture_with_gate_options(
     Ok(response)
 }
 
-/// Probe budget for post-deadline honesty lookup. Kept short: this path only
-/// runs when the insert already exhausted the outer 1s budget.
+/// Per-statement timeout inside the probe transaction.
+pub const CAPTURE_PROBE_STATEMENT_TIMEOUT_MS: u64 = 150;
+
+/// Worst-case sequential statements on Path A (ASE present):
+/// begin + set_config + exact-triple SELECT + ns/ref SELECT + commit.
+/// Live 2026-07-28: 200ms outer starved this path (persisted_probe_error).
+pub const CAPTURE_PROBE_PATH_A_SEQUENTIAL_STATEMENTS: u64 = 5;
+
+/// Probe budget for post-deadline honesty lookup.
+/// Must cover Path A statement budget (5 x 150ms = 750ms) plus slack.
 pub const CAPTURE_PERSISTENCE_PROBE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_millis(200);
+    std::time::Duration::from_millis(
+        CAPTURE_PROBE_STATEMENT_TIMEOUT_MS * CAPTURE_PROBE_PATH_A_SEQUENTIAL_STATEMENTS + 50,
+    );
 
 /// Local statement_timeout for the persistence probe transaction.
 const CAPTURE_PROBE_STATEMENT_TIMEOUT: &str = "150ms";
@@ -954,6 +964,22 @@ pub mod test_hooks {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn probe_outer_covers_path_a_statement_budget() {
+        let outer = super::CAPTURE_PERSISTENCE_PROBE_TIMEOUT.as_millis() as u64;
+        let need = super::CAPTURE_PROBE_STATEMENT_TIMEOUT_MS
+            * super::CAPTURE_PROBE_PATH_A_SEQUENTIAL_STATEMENTS;
+        assert!(
+            outer >= need,
+            "outer probe timeout {outer}ms must cover Path A {need}ms (5 x 150ms statements)"
+        );
+        // The 200ms budget that lost 2026-07-28 must stay illegal.
+        assert!(
+            outer > 200,
+            "outer {outer}ms must exceed the starved 200ms budget"
+        );
+    }
+
     use super::*;
     use kengram_core::EmbeddingModel;
     use serde_json::json;
