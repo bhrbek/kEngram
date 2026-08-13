@@ -511,10 +511,9 @@ pub const CAPTURE_PROBE_PATH_A_SEQUENTIAL_STATEMENTS: u64 = 5;
 
 /// Probe budget for post-deadline honesty lookup.
 /// Must cover Path A statement budget (5 x 150ms = 750ms) plus slack.
-pub const CAPTURE_PERSISTENCE_PROBE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_millis(
-        CAPTURE_PROBE_STATEMENT_TIMEOUT_MS * CAPTURE_PROBE_PATH_A_SEQUENTIAL_STATEMENTS + 50,
-    );
+pub const CAPTURE_PERSISTENCE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(
+    CAPTURE_PROBE_STATEMENT_TIMEOUT_MS * CAPTURE_PROBE_PATH_A_SEQUENTIAL_STATEMENTS + 50,
+);
 
 /// Local statement_timeout for the persistence probe transaction.
 const CAPTURE_PROBE_STATEMENT_TIMEOUT: &str = "150ms";
