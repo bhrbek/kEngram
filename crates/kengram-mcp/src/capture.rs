@@ -501,13 +501,38 @@ pub async fn capture_with_gate_options(
     Ok(response)
 }
 
-/// Probe budget for post-deadline honesty lookup. Kept short: this path only
-/// runs when the insert already exhausted the outer 1s budget.
-pub const CAPTURE_PERSISTENCE_PROBE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_millis(200);
+/// Per-statement timeout inside the probe transaction.
+/// Source of truth for both the SQL `set_config` string and the outer budget.
+pub const CAPTURE_PROBE_STATEMENT_TIMEOUT_MS: u64 = 150;
 
 /// Local statement_timeout for the persistence probe transaction.
+/// Must stay `format!("{}ms", CAPTURE_PROBE_STATEMENT_TIMEOUT_MS)` — the
+/// unit test refuses drift so the numeric budget and SQL timeout cannot
+/// silently diverge.
 const CAPTURE_PROBE_STATEMENT_TIMEOUT: &str = "150ms";
+
+/// Worst-case sequential statements on Path A (ASE present):
+/// begin + set_config + exact-triple SELECT + ns/ref SELECT + commit.
+/// Live 2026-07-28: 200ms outer starved this path (persisted_probe_error).
+pub const CAPTURE_PROBE_PATH_A_SEQUENTIAL_STATEMENTS: u64 = 5;
+
+/// Explicit headroom over Path A worst-case (`N * statement_timeout`).
+/// 3/2 = 1.5x. Ten-percent jitter on 750ms already needs 825ms; 50ms
+/// (+6.67%) lost that check before pool/scheduler/network. 1.5x is
+/// 1125ms: covers 10% jitter plus those overheads without inventing a
+/// measured production latency we do not have.
+pub const CAPTURE_PROBE_HEADROOM_NUMERATOR: u64 = 3;
+pub const CAPTURE_PROBE_HEADROOM_DENOMINATOR: u64 = 2;
+
+/// Probe budget for post-deadline honesty lookup.
+/// Derivation: N statements × per-statement timeout × 3/2 headroom
+/// = 5 × 150ms × 1.5 = 1125ms. Not a magic 800.
+pub const CAPTURE_PERSISTENCE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(
+    CAPTURE_PROBE_STATEMENT_TIMEOUT_MS
+        * CAPTURE_PROBE_PATH_A_SEQUENTIAL_STATEMENTS
+        * CAPTURE_PROBE_HEADROOM_NUMERATOR
+        / CAPTURE_PROBE_HEADROOM_DENOMINATOR,
+);
 
 /// Result of post-deadline recovery (jones P1: content-only synthesis lies).
 #[derive(Debug, Clone)]
@@ -954,6 +979,50 @@ pub mod test_hooks {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn probe_outer_covers_path_a_statement_budget() {
+        let stmt = super::CAPTURE_PROBE_STATEMENT_TIMEOUT_MS;
+        let n = super::CAPTURE_PROBE_PATH_A_SEQUENTIAL_STATEMENTS;
+        let num = super::CAPTURE_PROBE_HEADROOM_NUMERATOR;
+        let den = super::CAPTURE_PROBE_HEADROOM_DENOMINATOR;
+        let outer = super::CAPTURE_PERSISTENCE_PROBE_TIMEOUT.as_millis() as u64;
+        let worst = stmt * n;
+        let derived = worst * num / den;
+        let jitter_10pct = (worst * 11).div_ceil(10);
+
+        // SQL set_config string and numeric source must be the same timeout.
+        assert_eq!(
+            format!("{stmt}ms"),
+            super::CAPTURE_PROBE_STATEMENT_TIMEOUT,
+            "statement-timeout string must derive from CAPTURE_PROBE_STATEMENT_TIMEOUT_MS"
+        );
+
+        // Policy: named factor is at least 1.5x. A 1/1 (zero slack) or
+        // 11/10 (bare 10% jitter) mutant must die here, not only 200ms.
+        assert!(
+            den > 0 && num * 1000 / den >= 1500,
+            "headroom {num}/{den} must be at least 3/2 (1.5x); zero/insufficient slack is illegal"
+        );
+
+        assert_eq!(
+            outer, derived,
+            "outer {outer}ms must equal N*stmt*headroom = {n}*{stmt}*{num}/{den} = {derived}ms"
+        );
+        assert!(
+            outer > worst,
+            "outer {outer}ms must exceed Path A worst-case {worst}ms (zero slack is illegal)"
+        );
+        assert!(
+            outer >= jitter_10pct,
+            "outer {outer}ms must cover 10% jitter on Path A ({jitter_10pct}ms)"
+        );
+        // The 200ms budget that lost 2026-07-28 must stay illegal.
+        assert!(
+            outer > 200,
+            "outer {outer}ms must exceed the starved 200ms budget"
+        );
+    }
+
     use super::*;
     use kengram_core::EmbeddingModel;
     use serde_json::json;
