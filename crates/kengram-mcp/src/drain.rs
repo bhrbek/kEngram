@@ -347,6 +347,26 @@ enum TagJobOutcome {
     Permanent,
 }
 
+async fn abandon_or_retry_tag_job(
+    pool: &PgPool,
+    job: &kengram_storage::PendingTagJob,
+) -> TagJobOutcome {
+    let attempts_after = job.attempts.saturating_add(1);
+    if attempts_after >= MAX_TAG_ATTEMPTS {
+        let _ = kengram_storage::complete_tag_job(pool, job.thought_id, job.tag_job_generation_id)
+            .await;
+        TagJobOutcome::Permanent
+    } else {
+        let _ = kengram_storage::increment_tag_job_attempts(
+            pool,
+            job.thought_id,
+            job.tag_job_generation_id,
+        )
+        .await;
+        TagJobOutcome::Transient
+    }
+}
+
 async fn process_tag_job(
     pool: &PgPool,
     tagger: &dyn Tagger,
@@ -355,6 +375,17 @@ async fn process_tag_job(
     known_scopes: &[String],
     vocab_cache: Arc<Mutex<HashMap<String, Option<kengram_core::ScopeVocab>>>>,
 ) -> TagJobOutcome {
+    if job.attempts >= MAX_TAG_ATTEMPTS {
+        tracing::warn!(
+            thought_id = %job.thought_id,
+            attempts = job.attempts,
+            "tag-drain: dropping poisoned job at max attempts before another tagger call",
+        );
+        let _ = kengram_storage::complete_tag_job(pool, job.thought_id, job.tag_job_generation_id)
+            .await;
+        return TagJobOutcome::Permanent;
+    }
+
     // Fetch the thought's content.
     let thought = match kengram_storage::fetch_thought(pool, job.thought_id).await {
         Ok(Some(t)) => t,
@@ -374,13 +405,7 @@ async fn process_tag_job(
                 error = %e,
                 "tag-drain: storage error fetching thought; leaving job for retry",
             );
-            let _ = kengram_storage::increment_tag_job_attempts(
-                pool,
-                job.thought_id,
-                job.tag_job_generation_id,
-            )
-            .await;
-            return TagJobOutcome::Transient;
+            return abandon_or_retry_tag_job(pool, job).await;
         }
     };
 
@@ -414,13 +439,7 @@ async fn process_tag_job(
                                 error = %e,
                                 "tag-drain: scope vocab fetch failed; leaving job for retry",
                             );
-                            let _ = kengram_storage::increment_tag_job_attempts(
-                                pool,
-                                job.thought_id,
-                                job.tag_job_generation_id,
-                            )
-                            .await;
-                            return TagJobOutcome::Transient;
+                            return abandon_or_retry_tag_job(pool, job).await;
                         }
                     }
                 }
@@ -463,13 +482,7 @@ async fn process_tag_job(
                     error = %e,
                     "tag-drain: failed to persist tags; leaving job for retry",
                 );
-                let _ = kengram_storage::increment_tag_job_attempts(
-                    pool,
-                    job.thought_id,
-                    job.tag_job_generation_id,
-                )
-                .await;
-                return TagJobOutcome::Transient;
+                return abandon_or_retry_tag_job(pool, job).await;
             }
             // Emit tagger-extracted relations (M6.1). Soft-delete prior
             // tagger edges first so re-tag cycles produce a clean replacement;
@@ -490,13 +503,8 @@ async fn process_tag_job(
                     error = %e,
                     "tag-drain: atomic relation replacement failed; leaving job for retry",
                 );
-                let _ = kengram_storage::increment_tag_job_attempts(
-                    pool,
-                    job.thought_id,
-                    job.tag_job_generation_id,
-                )
-                .await;
-                return TagJobOutcome::Transient;
+                // RELATION_REPLACEMENT_EXHAUSTION: must go through abandon_or_retry
+                return abandon_or_retry_tag_job(pool, job).await;
             }
             if let Err(e) =
                 kengram_storage::complete_tag_job(pool, job.thought_id, job.tag_job_generation_id)
@@ -621,8 +629,8 @@ mod tests {
     use super::*;
     use crate::capture::{CaptureRequest, capture};
     use kengram_core::{
-        EmbeddingModel, ExtractedTarget, LinkSource, LinkTarget, RelationKind, Scope, Source,
-        TagKind, TagOutput, Tags,
+        EmbeddingModel, ExtractedRelation, ExtractedTarget, LinkSource, LinkTarget, RelationKind,
+        Scope, Source, TagKind, TagOutput, Tags,
     };
     use kengram_embed::{FakeBehavior, FakeEmbedder};
     use kengram_extract::{FakeBehavior as TaggerFakeBehavior, FakeTagger};
@@ -892,6 +900,143 @@ mod tests {
             .await
             .unwrap();
         assert!(jobs.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_tags_skips_poison_row_so_fifo_tail_drains(pool: PgPool) {
+        let poison = capture_and_enqueue_tag(&pool, "POISON-ROW").await;
+        let healthy = capture_and_enqueue_tag(&pool, "healthy-behind").await;
+        let poison_gen = kengram_storage::fetch_pending_tag_jobs(&pool, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|job| job.thought_id == poison)
+            .unwrap()
+            .tag_job_generation_id;
+        for _ in 0..MAX_TAG_ATTEMPTS {
+            kengram_storage::increment_tag_job_attempts(&pool, poison, poison_gen)
+                .await
+                .unwrap();
+        }
+
+        // Distinctive VALID output: if the pre-tagger skip is removed, the
+        // tagger is invoked and this marker persists. Invalid relations hid
+        // that call behind abandon_or_retry (trinity F1).
+        let poison_output = TagOutput {
+            tags: Tags {
+                people: vec!["POISON-SKIP-MARKER".into()],
+                ..Tags::default()
+            },
+            relations: vec![],
+        };
+        let healthy_output = TagOutput {
+            tags: Tags {
+                topics: vec!["ok".into()],
+                ..Tags::default()
+            },
+            relations: vec![],
+        };
+        let tagger = FakeTagger::with_substring(vec![
+            ("POISON-ROW".into(), poison_output),
+            ("healthy-behind".into(), healthy_output),
+        ]);
+
+        let first = drain_pending_tags(&pool, &tagger, 1, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(first.processed, 1);
+        assert_eq!(first.failed_permanent, 1);
+        assert_eq!(first.completed, 0);
+        assert!(
+            tagger
+                .all_calls()
+                .iter()
+                .all(|call| call.content != "POISON-ROW"),
+            "pre-tagger skip must not call the tagger for the poison row; calls={:?}",
+            tagger
+                .all_calls()
+                .iter()
+                .map(|c| c.content.clone())
+                .collect::<Vec<_>>(),
+        );
+        let poison_read = kengram_storage::fetch_thought_tags(&pool, poison)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(poison_read.tagger_model_id.is_none());
+        assert!(
+            !poison_read
+                .tags
+                .people
+                .iter()
+                .any(|p| p == "POISON-SKIP-MARKER")
+        );
+        let remaining = kengram_storage::fetch_pending_tag_jobs(&pool, 10)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].thought_id, healthy);
+
+        let second = drain_pending_tags(&pool, &tagger, 1, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(second.completed, 1);
+        let remaining = kengram_storage::fetch_pending_tag_jobs(&pool, 10)
+            .await
+            .unwrap();
+        assert!(remaining.is_empty());
+        let read = kengram_storage::fetch_thought_tags(&pool, healthy)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.tags.topics, vec!["ok".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_tags_relation_replacement_at_max_minus_one_is_permanent(pool: PgPool) {
+        // trinity F2: relation-replacement errors must use abandon_or_retry so
+        // MAX-1 becomes permanent. The attempts-0 invalid-target fixture stays
+        // Transient. A mutant that restores increment/Transient here stays GREEN
+        // on that fixture and RED on this one.
+        let id = capture_and_enqueue_tag(&pool, "relation-exhaust").await;
+        let generation_id = kengram_storage::fetch_pending_tag_jobs(&pool, 1)
+            .await
+            .unwrap()[0]
+            .tag_job_generation_id;
+        for _ in 0..(MAX_TAG_ATTEMPTS - 1) {
+            kengram_storage::increment_tag_job_attempts(&pool, id, generation_id)
+                .await
+                .unwrap();
+        }
+
+        let canned = tag_output_with_relations(vec![ExtractedRelation {
+            relation: RelationKind::References,
+            target: ExtractedTarget::Url("ftp://bad.example".into()),
+            note: None,
+        }]);
+        let tagger = FakeTagger::with_canned_output(canned);
+        let report = drain_pending_tags(&pool, &tagger, 10, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.failed_permanent, 1);
+        assert_eq!(report.failed_transient, 0);
+        assert_eq!(report.completed, 0);
+
+        let jobs = kengram_storage::fetch_pending_tag_jobs(&pool, 10)
+            .await
+            .unwrap();
+        assert!(jobs.is_empty());
+        let related = kengram_storage::fetch_related_thoughts(
+            &pool,
+            id,
+            None,
+            None,
+            kengram_core::LinkDirection::Outbound,
+        )
+        .await
+        .unwrap();
+        assert!(related.is_empty());
     }
 
     #[sqlx::test(migrations = "../../migrations")]
