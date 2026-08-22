@@ -15,21 +15,20 @@ use kengram_core::{
 };
 use kengram_embed::Reranker;
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
         InitializeRequestParams, InitializeResult, ProtocolVersion, ServerCapabilities, ServerInfo,
     },
     schemars,
     service::{MaybeSendFuture, RequestContext},
-    tool, tool_handler, tool_router,
+    tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
 };
 use serde::Deserialize;
 use sqlx::PgPool;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::time::Instant;
 
 use crate::capture::{self, CaptureError, CaptureRequest, MAX_CONTENT_LEN};
@@ -51,6 +50,14 @@ const CAPTURE_TOTAL_TIMEOUT: Duration = Duration::from_secs(1);
 /// MCP call after the insert path already timed out; elapsed routes to the
 /// existing `persisted: null` / `persisted_probe_error` envelope.
 const CAPTURE_PROBE_TIMEOUT: Duration = capture::CAPTURE_PERSISTENCE_PROBE_TIMEOUT;
+
+/// Serialized `search_thoughts` default-response budget. Strictly less than.
+const RESPONSE_BUDGET: usize = 40_000;
+/// Initial per-hit content char allowance before the serialize-measure-shrink loop.
+const CONTENT_CAP: usize = 800;
+/// Preferred content preview; NOT a floor. Budget pressure may go below this, or empty.
+#[allow(dead_code)]
+const MIN_PREVIEW: usize = 200;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CaptureArgs {
@@ -180,6 +187,11 @@ pub struct SearchThoughtsArgs {
     // Tightening to Map is semantically correct (the filter must be an
     // object for JSONB-containment to make sense).
     pub tag_filter: Option<serde_json::Map<String, serde_json::Value>>,
+
+    #[schemars(
+        description = "When true, restore the full hit shape (metadata, tags, provenance, per-leg scores, chunk keys). Defaults false. Default hits are compact: thought_id, content (capped), scope, created_at, score, topics, content_truncated; the serialized response stays strictly under 40,000 bytes. Full body remains on get_thought."
+    )]
+    pub verbose: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -766,7 +778,7 @@ impl KengramServer {
     }
 
     #[tool(
-        description = "Hybrid search across captured thoughts. Combines vector kNN (over the active embedding model) with Postgres FTS lexical search via reciprocal rank fusion, then applies a recency boost. The FTS leg uses a GIN inverted index over active thought content and is still defensively bounded so timeout/errors soft-fail to an empty lexical leg instead of failing the whole request. When a cross-encoder reranker is configured, the top `candidate_pool` post-RRF hits are re-scored and returned in rerank order. Scope filtering: use `scope` for exact match or `scope_prefix` for namespace match — supply at most one (mutually exclusive; supplying both returns an error). Optional `tag_filter` narrows to thoughts whose tags JSONB satisfies a containment query. Scope filter (whichever you pick), `tag_filter`, and the search query all compose via AND. If the embedder is unreachable, `vector_search_available` is false and search returns whatever bounded lexical hits are available; if the reranker fails, results come back in RRF + recency order and `rerank_used` is false. Each hit carries the thought's tags so consumers can show / threshold without a follow-up get_thought. For each hit, follow up with `get_related_thoughts(thought_id)` to walk the graph layer — refinements, replacements, supports, citations, and other edges the agent has linked. The search-then-traverse pattern is how a discovery walk arrives at the relational context of a hit."
+        description = "Hybrid search across captured thoughts. Combines vector kNN (over the active embedding model) with Postgres FTS lexical search via reciprocal rank fusion, then applies a recency boost. The FTS leg uses a GIN inverted index over active thought content and is still defensively bounded so timeout/errors soft-fail to an empty lexical leg instead of failing the whole request. When a cross-encoder reranker is configured, the top `candidate_pool` post-RRF hits are re-scored and returned in rerank order. Scope filtering: use `scope` for exact match or `scope_prefix` for namespace match — supply at most one (mutually exclusive; supplying both returns an error). Optional `tag_filter` narrows to thoughts whose tags JSONB satisfies a containment query. Scope filter (whichever you pick), `tag_filter`, and the search query all compose via AND. If the embedder is unreachable, `vector_search_available` is false and search returns whatever bounded lexical hits are available; if the reranker fails, results come back in RRF + recency order and `rerank_used` is false. Default hits are compact (thought_id, content preview, scope, created_at, score, topics, content_truncated) and the serialized response is kept strictly under 40,000 bytes; pass verbose: true for full metadata/tags/provenance. Follow up with `get_thought` for a full body. For each hit, follow up with `get_related_thoughts(thought_id)` to walk the graph layer — refinements, replacements, supports, citations, and other edges the agent has linked. The search-then-traverse pattern is how a discovery walk arrives at the relational context of a hit."
     )]
     async fn search_thoughts(
         &self,
@@ -812,6 +824,7 @@ impl KengramServer {
             &resp,
             self.chunk_serving_enabled,
             self.full_pipeline_enabled,
+            args.verbose.unwrap_or(false),
         ))
         .map_err(|e| format!("response serialization error: {e}"))
     }
@@ -1269,7 +1282,92 @@ fn related_thoughts_response_json(
     })
 }
 
-fn search_response_json(
+fn truncate_content_chars(content: &str, max_chars: usize) -> (String, bool) {
+    let total = content.chars().count();
+    if total <= max_chars {
+        return (content.to_string(), false);
+    }
+    (content.chars().take(max_chars).collect(), true)
+}
+
+fn search_hit_score(h: &search::SearchHit) -> serde_json::Value {
+    if let Some(score) = h.rerank_score {
+        serde_json::json!(score)
+    } else if let Some(score) = h.rrf_score {
+        serde_json::json!(score)
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+fn trimmed_hit_json(h: &search::SearchHit, allowance: usize) -> serde_json::Value {
+    let (content, truncated) = truncate_content_chars(&h.content, allowance);
+    serde_json::json!({
+        "thought_id": h.thought_id.to_string(),
+        "content": content,
+        "scope": h.scope.as_str(),
+        "created_at": h.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+        "score": search_hit_score(h),
+        "topics": h.tags.topics,
+        "content_truncated": truncated,
+    })
+}
+
+fn trimmed_envelope(
+    hits: &[search::SearchHit],
+    allowance: usize,
+    hits_omitted: usize,
+    resp: &SearchResponse,
+) -> serde_json::Value {
+    let results: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|h| trimmed_hit_json(h, allowance))
+        .collect();
+    let mut body = serde_json::json!({
+        "results": results,
+        "vector_search_available": resp.vector_search_available,
+        "rerank_used": resp.rerank_used,
+        "degradations": resp.degradations,
+    });
+    if hits_omitted > 0 {
+        body["hits_omitted"] = serde_json::json!(hits_omitted);
+    }
+    if let Some(profile) = resp.profile.as_ref() {
+        body["profile"] = serde_json::to_value(profile).unwrap_or(serde_json::Value::Null);
+    }
+    body
+}
+
+fn search_response_json_trimmed_with_passes(resp: &SearchResponse) -> (serde_json::Value, usize) {
+    let mut hits: Vec<search::SearchHit> = resp.results.clone();
+    let mut hits_omitted: usize = 0;
+    let mut passes: usize = 0;
+    if hits.is_empty() {
+        passes += 1;
+        return (trimmed_envelope(&hits, CONTENT_CAP, 0, resp), passes);
+    }
+    let mut allowance = CONTENT_CAP;
+    loop {
+        let candidate = trimmed_envelope(&hits, allowance, hits_omitted, resp);
+        let serialized = serde_json::to_string(&candidate).expect("search envelope serializes");
+        passes += 1;
+        if serialized.len() < RESPONSE_BUDGET {
+            return (candidate, passes);
+        }
+        if allowance > 0 {
+            allowance /= 2;
+            continue;
+        }
+        if !hits.is_empty() {
+            hits.pop();
+            hits_omitted += 1;
+            continue;
+        }
+        return (trimmed_envelope(&[], 0, hits_omitted, resp), passes);
+    }
+}
+
+fn search_response_json_verbose(
     resp: &SearchResponse,
     include_chunk_provenance: bool,
     include_full_pipeline_tags: bool,
@@ -1375,6 +1473,19 @@ fn search_response_json(
         body["profile"] = serde_json::to_value(profile).unwrap_or(serde_json::Value::Null);
     }
     body
+}
+
+fn search_response_json(
+    resp: &SearchResponse,
+    include_chunk_provenance: bool,
+    include_full_pipeline_tags: bool,
+    verbose: bool,
+) -> serde_json::Value {
+    if verbose {
+        search_response_json_verbose(resp, include_chunk_provenance, include_full_pipeline_tags)
+    } else {
+        search_response_json_trimmed_with_passes(resp).0
+    }
 }
 
 fn recent_response_json(resp: &RecentResponse) -> serde_json::Value {
@@ -1767,7 +1878,7 @@ mod tests {
 
     #[test]
     fn search_response_json_omits_chunk_keys_when_flag_off_without_chunk_hit() {
-        let json = search_response_json(&search_json_response(), false, false);
+        let json = search_response_json(&search_json_response(), false, false, true);
         let hit = json["results"][0].as_object().unwrap();
         for key in [
             "chunk_id",
@@ -1791,7 +1902,7 @@ mod tests {
 
     #[test]
     fn search_response_json_includes_chunk_keys_when_flag_on() {
-        let json = search_response_json(&search_json_response(), true, false);
+        let json = search_response_json(&search_json_response(), true, false, true);
         let hit = json["results"][0].as_object().unwrap();
         for key in [
             "chunk_id",
@@ -1820,7 +1931,7 @@ mod tests {
         resp.results[0].tags.retrieval_aliases = vec!["memory search".to_string()];
         resp.results[0].tags.domain_scope = Some("infra".to_string());
 
-        let json = search_response_json(&resp, false, false);
+        let json = search_response_json(&resp, false, false, true);
         let hit = json["results"][0].as_object().unwrap();
         let tags = json["results"][0]["tags"].as_object().unwrap();
         assert!(!tags.contains_key("retrieval_aliases"));
@@ -1834,7 +1945,7 @@ mod tests {
         resp.results[0].tags.retrieval_aliases = vec!["memory search".to_string()];
         resp.results[0].tags.domain_scope = Some("infra".to_string());
 
-        let json = search_response_json(&resp, false, true);
+        let json = search_response_json(&resp, false, true, true);
         let hit = json["results"][0].as_object().unwrap();
         let tags = json["results"][0]["tags"].as_object().unwrap();
         assert_eq!(
@@ -1857,10 +1968,266 @@ mod tests {
             note: Some("fixture edge".to_string()),
         }];
 
-        let json = search_response_json(&resp, false, false);
+        let json = search_response_json(&resp, false, false, true);
         let hit = json["results"][0].as_object().unwrap();
         assert_eq!(hit["graph_provenance"][0]["relation"], "supports");
         assert_eq!(hit["graph_provenance"][0]["direction"], "outbound");
+    }
+
+    const FAT_KEYS: [&str; 9] = [
+        "metadata",
+        "source",
+        "tags",
+        "vector_score",
+        "lexical_score",
+        "trigram_score",
+        "rrf_score",
+        "rerank_score",
+        "graph_provenance",
+    ];
+    const THIN_KEYS: [&str; 7] = [
+        "thought_id",
+        "content",
+        "scope",
+        "created_at",
+        "score",
+        "topics",
+        "content_truncated",
+    ];
+
+    fn budget_hit(n: u32, content: String, topics: Vec<String>) -> search::SearchHit {
+        let mut hit = search_json_hit();
+        hit.thought_id = ThoughtId::from_str(&format!("00000000-0000-4000-8000-{n:012}")).unwrap();
+        hit.created_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        hit.content = content;
+        hit.tags.topics = topics;
+        hit.rerank_score = Some(0.5);
+        hit.rrf_score = Some(0.25);
+        hit.scope = Scope::new("sessions/carl").unwrap();
+        hit
+    }
+
+    fn budget_response(hits: Vec<search::SearchHit>) -> SearchResponse {
+        SearchResponse {
+            results: hits,
+            vector_search_available: true,
+            rerank_used: true,
+            degradations: vec![],
+            profile: None,
+        }
+    }
+
+    fn serialized_len(v: &serde_json::Value) -> usize {
+        serde_json::to_string(v).unwrap().len()
+    }
+
+    #[test]
+    fn search_response_json_v1_default_omits_fat_keys() {
+        let json = search_response_json(&search_json_response(), false, false, false);
+        let hit = json["results"][0].as_object().unwrap();
+        for key in FAT_KEYS {
+            assert!(!hit.contains_key(key), "default must omit `{key}`");
+        }
+        for key in hit.keys() {
+            assert!(
+                !key.starts_with("chunk_"),
+                "default must omit chunk key `{key}`"
+            );
+        }
+    }
+
+    #[test]
+    fn search_response_json_v2_default_keeps_thin_keys_score_rerank() {
+        let mut resp = search_json_response();
+        resp.results[0].rerank_score = Some(0.5);
+        resp.results[0].rrf_score = Some(0.25);
+        resp.results[0].tags.topics = vec!["rust".into()];
+        let json = search_response_json(&resp, false, false, false);
+        let hit = json["results"][0].as_object().unwrap();
+        for key in THIN_KEYS {
+            assert!(hit.contains_key(key), "default must keep `{key}`");
+        }
+        assert_eq!(hit["score"], serde_json::json!(0.5));
+        assert_eq!(hit["topics"], serde_json::json!(["rust"]));
+        assert_eq!(hit["content_truncated"], false);
+    }
+
+    #[test]
+    fn search_response_json_v3_verbose_restores_fat_shape() {
+        let mut resp = search_json_response();
+        resp.results[0].content = "x".repeat(5_000);
+        let verbose = search_response_json(&resp, false, false, true);
+        let trimmed = search_response_json(&resp, false, false, false);
+        let vhit = verbose["results"][0].as_object().unwrap();
+        let thit = trimmed["results"][0].as_object().unwrap();
+        for key in FAT_KEYS {
+            if key == "graph_provenance" {
+                continue; // empty provenance omitted when flag off
+            }
+            assert!(vhit.contains_key(key), "verbose must restore `{key}`");
+            assert!(!thit.contains_key(key), "default must drop `{key}`");
+        }
+        assert_eq!(vhit["content"].as_str().unwrap().len(), 5_000);
+        assert!(thit["content"].as_str().unwrap().chars().count() <= CONTENT_CAP);
+        assert_eq!(thit["content_truncated"], true);
+        assert_ne!(verbose, trimmed);
+    }
+
+    #[test]
+    fn search_response_json_v4_content_cap_fires() {
+        let mut resp = search_json_response();
+        resp.results[0].content = "a".repeat(5_000);
+        let json = search_response_json(&resp, false, false, false);
+        let content = json["results"][0]["content"].as_str().unwrap();
+        assert!(content.chars().count() <= CONTENT_CAP);
+        assert_eq!(json["results"][0]["content_truncated"], true);
+    }
+
+    #[test]
+    fn search_response_json_v5_short_content_untouched() {
+        let mut resp = search_json_response();
+        resp.results[0].content = "short".to_string();
+        let json = search_response_json(&resp, false, false, false);
+        assert_eq!(json["results"][0]["content"], "short");
+        assert_eq!(json["results"][0]["content_truncated"], false);
+    }
+
+    #[test]
+    fn search_response_json_v6_budget_binds_at_scale() {
+        let hits: Vec<_> = (1..=100)
+            .map(|n| budget_hit(n, "a".repeat(5_000), vec![]))
+            .collect();
+        let json = search_response_json(&budget_response(hits), false, false, false);
+        assert!(serialized_len(&json) < RESPONSE_BUDGET);
+    }
+
+    #[test]
+    fn search_response_json_v6a_empty_results() {
+        let json = search_response_json(&budget_response(vec![]), false, false, false);
+        assert_eq!(json["results"].as_array().unwrap().len(), 0);
+        assert!(serialized_len(&json) < RESPONSE_BUDGET);
+        assert!(json.get("hits_omitted").is_none());
+    }
+
+    #[test]
+    fn search_response_json_v6b_minimal_shape_100_fits() {
+        let hits: Vec<_> = (1..=100)
+            .map(|n| budget_hit(n, "ok".to_string(), vec!["t".into()]))
+            .collect();
+        let json = search_response_json(&budget_response(hits), false, false, false);
+        assert_eq!(json["results"].as_array().unwrap().len(), 100);
+        assert!(serialized_len(&json) < RESPONSE_BUDGET);
+    }
+
+    #[test]
+    fn search_response_json_v6c_high_overhead_topics_shed() {
+        let fat = "t".repeat(14_719);
+        let hits: Vec<_> = (1..=100)
+            .map(|n| budget_hit(n, "body".to_string(), vec![fat.clone()]))
+            .collect();
+        let json = search_response_json(&budget_response(hits), false, false, false);
+        assert!(serialized_len(&json) < RESPONSE_BUDGET);
+        assert!(
+            json["hits_omitted"].as_u64().unwrap() > 0,
+            "pathological topics must shed lowest-ranked hits"
+        );
+    }
+
+    #[test]
+    fn search_response_json_v6d_escape_heavy_content() {
+        let content = "\"\\\n".repeat(1_667); // quote / backslash / newline
+        let hits: Vec<_> = (1..=100)
+            .map(|n| budget_hit(n, content.clone(), vec![]))
+            .collect();
+        let json = search_response_json(&budget_response(hits), false, false, false);
+        assert!(serialized_len(&json) < RESPONSE_BUDGET);
+    }
+
+    #[test]
+    fn search_response_json_v6e_control_char_content() {
+        let content = "\u{0001}".repeat(5_000);
+        let hits: Vec<_> = (1..=100)
+            .map(|n| budget_hit(n, content.clone(), vec![]))
+            .collect();
+        let json = search_response_json(&budget_response(hits), false, false, false);
+        assert!(serialized_len(&json) < RESPONSE_BUDGET);
+    }
+
+    #[test]
+    fn search_response_json_v6f_pass_count_bound() {
+        let fat = "t".repeat(14_719);
+        let hits: Vec<_> = (1..=100)
+            .map(|n| budget_hit(n, "body".to_string(), vec![fat.clone()]))
+            .collect();
+        let n = hits.len();
+        let (_json, passes) = search_response_json_trimmed_with_passes(&budget_response(hits));
+        let max_passes = n + CONTENT_CAP.ilog2() as usize + 1;
+        assert!(
+            passes <= max_passes,
+            "passes={passes} max={max_passes} (hits + log2 CONTENT_CAP)"
+        );
+    }
+
+    #[test]
+    fn search_response_json_v6g_exact_boundary_shrinks() {
+        // Pad topics (not content) so the first loop candidate (allowance=CONTENT_CAP)
+        // serializes to exactly RESPONSE_BUDGET. Conforming `<` must shrink; Mutant I
+        // (`<=`) returns 40_000. Topics are not truncated by the allowance ladder.
+        let mut found = None;
+        for n in 1..=80u32 {
+            let hits: Vec<_> = (1..=n)
+                .map(|i| budget_hit(i, String::new(), vec![String::new()]))
+                .collect();
+            let resp = budget_response(hits.clone());
+            let base = trimmed_envelope(&hits, CONTENT_CAP, 0, &resp);
+            let base_len = serialized_len(&base);
+            if base_len >= RESPONSE_BUDGET {
+                continue;
+            }
+            let slack = RESPONSE_BUDGET - base_len;
+            for delta in [
+                slack.saturating_sub(2),
+                slack.saturating_sub(1),
+                slack,
+                slack + 1,
+                slack + 2,
+            ] {
+                let mut trial = hits.clone();
+                trial.last_mut().unwrap().tags.topics = vec!["x".repeat(delta)];
+                let c = trimmed_envelope(&trial, CONTENT_CAP, 0, &resp);
+                if serialized_len(&c) == RESPONSE_BUDGET {
+                    found = Some(trial);
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let hits = found.expect("must construct a CONTENT_CAP candidate of exactly 40000 B");
+        let resp = budget_response(hits);
+        let first = trimmed_envelope(&resp.results, CONTENT_CAP, 0, &resp);
+        assert_eq!(
+            serialized_len(&first),
+            RESPONSE_BUDGET,
+            "first loop candidate must be exactly the budget so Mutant I is armed"
+        );
+        let json = search_response_json(&resp, false, false, false);
+        let out = serialized_len(&json);
+        assert!(
+            out < RESPONSE_BUDGET,
+            "conforming `<` must shrink exact-boundary, got {out}"
+        );
+    }
+
+    #[test]
+    fn search_response_json_v7_utf8_char_boundary() {
+        let mut resp = search_json_response();
+        resp.results[0].content = "—".repeat(400) + "🎯" + &"…".repeat(400);
+        let json = search_response_json(&resp, false, false, false);
+        let content = json["results"][0]["content"].as_str().unwrap();
+        assert!(content.is_char_boundary(content.len()));
+        assert!(serialized_len(&json) < RESPONSE_BUDGET);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -2531,6 +2898,7 @@ mod tests {
                 candidate_pool: None,
                 include_profile: None,
                 tag_filter: None,
+                verbose: None,
             }))
             .await
             .unwrap();
@@ -2539,12 +2907,10 @@ mod tests {
         let results = json["results"].as_array().unwrap();
         assert!(!results.is_empty());
         assert!(results[0]["thought_id"].is_string());
-        assert!(
-            results[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("tcgplayer")
-        );
+        assert!(results[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("tcgplayer"));
         // Each hit carries a tags object (empty by default).
         assert!(results[0]["tags"].is_object());
     }
@@ -2596,6 +2962,7 @@ mod tests {
                 candidate_pool: None,
                 include_profile: Some(false),
                 tag_filter: None,
+                verbose: None,
             }))
             .await
             .unwrap();
@@ -2669,6 +3036,7 @@ mod tests {
                 candidate_pool: None,
                 include_profile: Some(false),
                 tag_filter: None,
+                verbose: None,
             }))
             .await
             .unwrap();
@@ -2719,6 +3087,7 @@ mod tests {
                 candidate_pool: None,
                 include_profile: None,
                 tag_filter: None,
+                verbose: None,
             }))
             .await
             .unwrap();
@@ -2728,8 +3097,12 @@ mod tests {
             .iter()
             .find(|h| h["thought_id"] == cap_json["thought_id"])
             .expect("inserted hit present");
-        assert_eq!(hit["tags"]["topics"], serde_json::json!(["rust"]));
-        assert_eq!(hit["tags"]["kind"], "idea");
+        assert_eq!(hit["topics"], serde_json::json!(["rust"]));
+        assert!(
+            hit.get("tags").is_none(),
+            "default search hits omit the tags object"
+        );
+        assert_eq!(hit["content_truncated"], false);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -2789,6 +3162,7 @@ mod tests {
                 candidate_pool: None,
                 include_profile: None,
                 tag_filter: serde_json::json!({"kind": "task"}).as_object().cloned(),
+                verbose: None,
             }))
             .await
             .unwrap();
@@ -2826,6 +3200,7 @@ mod tests {
                 candidate_pool: None,
                 include_profile: None,
                 tag_filter: None,
+                verbose: None,
             }))
             .await
             .unwrap();
@@ -2834,10 +3209,13 @@ mod tests {
         assert!(!results.is_empty());
         let first = &results[0];
         assert!(
-            first.get("score").is_none(),
-            "Phase C dropped `score` from search_thoughts hits"
+            first.get("score").is_some(),
+            "default search hits expose one unified score"
         );
-        assert!(first.get("rrf_score").is_some());
+        assert!(
+            first.get("rrf_score").is_none(),
+            "default search hits omit per-leg scores; use verbose: true"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
