@@ -15,20 +15,21 @@ use kengram_core::{
 };
 use kengram_embed::Reranker;
 use rmcp::{
+    ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
         InitializeRequestParams, InitializeResult, ProtocolVersion, ServerCapabilities, ServerInfo,
     },
     schemars,
     service::{MaybeSendFuture, RequestContext},
-    tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
+    tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
 use sqlx::PgPool;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::time::Instant;
 
 use crate::capture::{self, CaptureError, CaptureRequest, MAX_CONTENT_LEN};
@@ -2907,12 +2908,15 @@ mod tests {
         let results = json["results"].as_array().unwrap();
         assert!(!results.is_empty());
         assert!(results[0]["thought_id"].is_string());
-        assert!(results[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("tcgplayer"));
-        // Each hit carries a tags object (empty by default).
-        assert!(results[0]["tags"].is_object());
+        assert!(
+            results[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("tcgplayer")
+        );
+        // Default hits carry topics, not the tags object.
+        assert!(results[0]["topics"].is_array());
+        assert!(results[0].get("tags").is_none());
     }
 
     /// V4 — real KengramServer::search_thoughts handler emits degradations JSON.
